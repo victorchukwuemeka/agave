@@ -433,7 +433,7 @@ impl AccountsBackgroundService {
         let mut removed_slots_count = 0;
         let mut total_remove_slots_time = 0;
         let t_background = Builder::new()
-            .name("solBgAccounts".to_string())
+            .name("solAcctsBgSvc".to_string())
             .spawn({
                 let is_running = is_running.clone();
                 let stop = stop.clone();
@@ -715,10 +715,8 @@ fn cmp_snapshot_request_kinds_by_priority(
 mod test {
     use {
         super::*,
-        crate::{
-            genesis_utils::create_genesis_config, snapshot_config::SnapshotConfig,
-            snapshot_utils::SnapshotInterval,
-        },
+        crate::{genesis_utils::create_genesis_config, snapshot_config::SnapshotConfig},
+        agave_snapshots::SnapshotInterval,
         crossbeam_channel::unbounded,
         solana_account::AccountSharedData,
         solana_epoch_schedule::EpochSchedule,

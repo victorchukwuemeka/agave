@@ -106,6 +106,7 @@ impl FeatureSet {
                 .is_active(&move_precompile_verification_to_svm::id()),
             stricter_abi_and_runtime_constraints: self
                 .is_active(&stricter_abi_and_runtime_constraints::id()),
+            account_data_direct_mapping: self.is_active(&account_data_direct_mapping::id()),
             enable_bpf_loader_set_authority_checked_ix: self
                 .is_active(&enable_bpf_loader_set_authority_checked_ix::id()),
             enable_loader_v4: self.is_active(&enable_loader_v4::id()),
@@ -156,6 +157,9 @@ impl FeatureSet {
             reenable_zk_elgamal_proof_program: self
                 .is_active(&reenable_zk_elgamal_proof_program::id()),
             raise_cpi_nesting_limit_to_8: self.is_active(&raise_cpi_nesting_limit_to_8::id()),
+            provide_instruction_data_offset_in_vm_r2: self
+                .is_active(&provide_instruction_data_offset_in_vm_r2::id()),
+            vote_state_v4: self.is_active(&vote_state_v4::id()),
         }
     }
 }
@@ -754,6 +758,10 @@ pub mod stricter_abi_and_runtime_constraints {
     solana_pubkey::declare_id!("CxeBn9PVeeXbmjbNwLv6U4C6svNxnC4JX6mfkvgeMocM");
 }
 
+pub mod account_data_direct_mapping {
+    solana_pubkey::declare_id!("9s3RKimHWS44rJcJ9P1rwCmn2TvMqtZQBmz815ZUUHqJ");
+}
+
 pub mod add_set_tx_loaded_accounts_data_size_instruction {
     solana_pubkey::declare_id!("G6vbf1UBok8MWb8m25ex86aoQHeKTzDKzuZADHkShqm6");
 }
@@ -1124,6 +1132,26 @@ pub mod raise_cpi_nesting_limit_to_8 {
 
 pub mod enforce_fixed_fec_set {
     solana_pubkey::declare_id!("fixfecLZYMfkGzwq6NJA11Yw6KYztzXiK9QcL3K78in");
+}
+
+pub mod provide_instruction_data_offset_in_vm_r2 {
+    solana_pubkey::declare_id!("5xXZc66h4UdB6Yq7FzdBxBiRAFMMScMLwHxk2QZDaNZL");
+}
+
+pub mod static_instruction_limit {
+    solana_pubkey::declare_id!("64ixypL1HPu8WtJhNSMb9mSgfFaJvsANuRkTbHyuLfnx");
+}
+
+pub mod discard_unexpected_data_complete_shreds {
+    solana_pubkey::declare_id!("8MhfKhoZEoiySpVe248bDkisyEcBA7JQLyUS94xoTSqN");
+}
+
+pub mod vote_state_v4 {
+    solana_pubkey::declare_id!("Gx4XFcrVMt4HUvPzTpTSVkdDVgcDSjKhDN1RqRS6KDuZ");
+
+    pub mod stake_program_buffer {
+        solana_pubkey::declare_id!("BM11F4hqrpinQs28sEZfzQ2fYddivYs4NEAHF6QMjkJF");
+    }
 }
 
 pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::new(|| {
@@ -1701,6 +1729,10 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
             "SIMD-0219: Stricter ABI and Runtime Constraints",
         ),
         (
+            account_data_direct_mapping::id(),
+            "enable account data direct mapping",
+        ),
+        (
             last_restart_slot_sysvar::id(),
             "enable new sysvar last_restart_slot",
         ),
@@ -2035,6 +2067,20 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
             enforce_fixed_fec_set::id(),
             "SIMD-0317: Enforce 32 data + 32 coding shreds",
         ),
+        (
+            provide_instruction_data_offset_in_vm_r2::id(),
+            "SIMD-0321: Provide instruction data offset in VM r2",
+        ),
+        (
+            static_instruction_limit::id(),
+            "SIMD-0160: static instruction limit",
+        ),
+        (
+            discard_unexpected_data_complete_shreds::id(),
+            "SIMD-0337: Markers for Alpenglow Fast Leader Handover, DATA_COMPLETE_SHRED placement \
+             rules",
+        ),
+        (vote_state_v4::id(), "SIMD-0185: Vote State v4"),
         /*************** ADD NEW FEATURES HERE ***************/
     ]
     .iter()

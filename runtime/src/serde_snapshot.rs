@@ -24,6 +24,7 @@ use {
         accounts_update_notifier_interface::AccountsUpdateNotifier,
         ancestors::AncestorsForSerialization,
         blockhash_queue::BlockhashQueue,
+        ObsoleteAccounts,
     },
     solana_clock::{Epoch, Slot, UnixTimestamp},
     solana_epoch_schedule::EpochSchedule,
@@ -61,7 +62,7 @@ mod utils;
 
 pub(crate) use {
     status_cache::{deserialize_status_cache, serialize_status_cache},
-    storage::{SerializableAccountStorageEntry, SerializedAccountsFileId},
+    storage::{SerdeObsoleteAccounts, SerializableAccountStorageEntry, SerializedAccountsFileId},
 };
 
 const MAX_STREAM_SIZE: u64 = 32 * 1024 * 1024 * 1024;
@@ -852,15 +853,35 @@ pub(crate) fn reconstruct_single_storage(
     slot: &Slot,
     append_vec_path: &Path,
     current_len: usize,
-    append_vec_id: AccountsFileId,
+    id: AccountsFileId,
     storage_access: StorageAccess,
+    obsolete_accounts: Option<SerdeObsoleteAccounts>,
 ) -> Result<Arc<AccountStorageEntry>, SnapshotError> {
+    // When restoring from an archive, obsolete accounts will always be `None`
+    // When restoring from fastboot, obsolete accounts will be 'Some' if the storage contained
+    // accounts marked obsolete at the time the snapshot was taken.
+    let (current_len, obsolete_accounts) = if let Some(obsolete_accounts) = obsolete_accounts {
+        let updated_len = current_len + obsolete_accounts.bytes as usize;
+        let id = id as SerializedAccountsFileId;
+        if obsolete_accounts.id != id {
+            return Err(SnapshotError::MismatchedAccountsFileId(
+                id,
+                obsolete_accounts.id,
+            ));
+        }
+
+        (updated_len, obsolete_accounts.accounts)
+    } else {
+        (current_len, ObsoleteAccounts::default())
+    };
+
     let accounts_file =
         AccountsFile::new_for_startup(append_vec_path, current_len, storage_access)?;
     Ok(Arc::new(AccountStorageEntry::new_existing(
         *slot,
-        append_vec_id,
+        id,
         accounts_file,
+        obsolete_accounts,
     )))
 }
 
@@ -959,6 +980,7 @@ pub(crate) fn remap_and_reconstruct_single_storage(
         current_len,
         remapped_append_vec_id,
         storage_access,
+        None,
     )?;
     Ok(storage)
 }

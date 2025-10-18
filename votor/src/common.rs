@@ -1,5 +1,5 @@
 use {
-    solana_votor_messages::{consensus_message::Certificate, vote::Vote},
+    agave_votor_messages::{consensus_message::Certificate, vote::Vote},
     std::time::Duration,
 };
 
@@ -16,6 +16,16 @@ pub enum VoteType {
 }
 
 impl VoteType {
+    pub fn get_type(vote: &Vote) -> VoteType {
+        match vote {
+            Vote::Notarize(_) => VoteType::Notarize,
+            Vote::NotarizeFallback(_) => VoteType::NotarizeFallback,
+            Vote::Skip(_) => VoteType::Skip,
+            Vote::SkipFallback(_) => VoteType::SkipFallback,
+            Vote::Finalize(_) => VoteType::Finalize,
+        }
+    }
+
     #[allow(dead_code)]
     pub fn is_notarize_type(&self) -> bool {
         matches!(self, Self::Notarize | Self::NotarizeFallback)
@@ -83,18 +93,17 @@ pub const SAFE_TO_NOTAR_MIN_NOTARIZE_AND_SKIP: f64 = 0.6;
 pub const SAFE_TO_SKIP_THRESHOLD: f64 = 0.4;
 
 /// Time bound assumed on network transmission delays during periods of synchrony.
-const DELTA: Duration = Duration::from_millis(250);
+pub(crate) const DELTA: Duration = Duration::from_millis(250);
 
 /// Time the leader has for producing and sending the block.
-const DELTA_BLOCK: Duration = Duration::from_millis(400);
+pub(crate) const DELTA_BLOCK: Duration = Duration::from_millis(400);
 
 /// Base timeout for when leader's first slice should arrive if they sent it immediately.
-const DELTA_TIMEOUT: Duration = DELTA.checked_mul(3).unwrap();
+pub(crate) const DELTA_TIMEOUT: Duration = DELTA.checked_mul(3).unwrap();
 
-#[allow(dead_code)]
-/// TODO(wen): remove allow(dead_code) when timer is fully integrated
+#[cfg(test)]
 /// Timeout for standstill detection mechanism.
-const DELTA_STANDSTILL: Duration = Duration::from_millis(10_000);
+pub(crate) const DELTA_STANDSTILL: Duration = Duration::from_millis(10_000);
 
 /// Returns the Duration for when the `SkipTimer` should be set for for the given slot in the leader window.
 #[inline]

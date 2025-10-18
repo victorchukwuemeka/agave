@@ -27,6 +27,7 @@ pub mod next_leader;
 pub mod optimistic_confirmation_verifier;
 pub mod repair;
 pub mod replay_stage;
+pub mod resource_limits;
 mod result;
 pub mod sample_performance_service;
 mod shred_fetch_stage;
@@ -49,9 +50,6 @@ pub mod window_service;
 
 #[macro_use]
 extern crate log;
-
-#[macro_use]
-extern crate serde_derive;
 
 #[macro_use]
 extern crate solana_metrics;

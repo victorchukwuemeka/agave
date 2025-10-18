@@ -9,9 +9,12 @@ use {
     rayon::prelude::*,
     solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_core::{
-        banking_stage::{update_bank_forks_and_poh_recorder_for_new_tpu_bank, BankingStage},
+        banking_stage::{
+            transaction_scheduler::scheduler_controller::SchedulerConfig,
+            update_bank_forks_and_poh_recorder_for_new_tpu_bank, BankingStage,
+        },
         banking_trace::{BankingTracer, Channels, BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT},
-        validator::{BlockProductionMethod, TransactionStructure},
+        validator::{BlockProductionMethod, SchedulerPacing, TransactionStructure},
     },
     solana_hash::Hash,
     solana_keypair::Keypair,
@@ -324,9 +327,6 @@ fn main() {
     let block_production_num_workers = matches
         .value_of_t::<NonZeroUsize>("block_production_num_workers")
         .unwrap_or_else(|_| BankingStage::default_num_workers());
-    let transaction_struct = matches
-        .value_of_t::<TransactionStructure>("transaction_struct")
-        .unwrap_or_default();
     //   a multiple of packet chunk duplicates to avoid races
     let num_chunks = matches.value_of_t::<usize>("num_chunks").unwrap_or(16);
     let packets_per_batch = matches
@@ -461,13 +461,15 @@ fn main() {
     } = banking_tracer.create_channels(false);
     let banking_stage = BankingStage::new_num_threads(
         block_production_method,
-        transaction_struct,
         poh_recorder.clone(),
         transaction_recorder,
         non_vote_receiver,
         tpu_vote_receiver,
         gossip_vote_receiver,
         block_production_num_workers,
+        SchedulerConfig {
+            scheduler_pacing: SchedulerPacing::Disabled,
+        },
         None,
         replay_vote_sender,
         None,

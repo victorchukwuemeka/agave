@@ -5,7 +5,8 @@ use {
         bank::{BankFieldsToDeserialize, BankFieldsToSerialize, BankHashStats, BankSlotDelta},
         serde_snapshot::{
             self, AccountsDbFields, ExtraFieldsToSerialize, SerializableAccountStorageEntry,
-            SnapshotAccountsDbFields, SnapshotBankFields, SnapshotStreams,
+            SerializedAccountsFileId, SnapshotAccountsDbFields, SnapshotBankFields,
+            SnapshotStreams,
         },
         snapshot_archive_info::{
             FullSnapshotArchiveInfo, IncrementalSnapshotArchiveInfo, SnapshotArchiveInfo,
@@ -18,9 +19,11 @@ use {
             get_slot_and_append_vec_id, SnapshotStorageRebuilder,
         },
     },
+    agave_snapshots::{ArchiveFormat, ArchiveFormatDecompressor},
     crossbeam_channel::{Receiver, Sender},
     log::*,
     regex::Regex,
+    semver::Version,
     solana_accounts_db::{
         account_storage::{AccountStorageMap, AccountStoragesOrderer},
         account_storage_reader::AccountStorageReader,
@@ -51,13 +54,12 @@ use {
     thiserror::Error,
 };
 
-mod archive_format;
-mod snapshot_interval;
 pub mod snapshot_storage_rebuilder;
-pub use {archive_format::*, snapshot_interval::SnapshotInterval};
 
 pub const SNAPSHOT_STATUS_CACHE_FILENAME: &str = "status_cache";
 pub const SNAPSHOT_VERSION_FILENAME: &str = "version";
+pub const SNAPSHOT_FASTBOOT_VERSION_FILENAME: &str = "fastboot_version";
+/// No longer checked in version v3.1. Can be removed in v3.2
 pub const SNAPSHOT_STATE_COMPLETE_FILENAME: &str = "state_complete";
 pub const SNAPSHOT_STORAGES_FLUSHED_FILENAME: &str = "storages_flushed";
 pub const SNAPSHOT_ACCOUNTS_HARDLINKS: &str = "accounts_hardlinks";
@@ -70,6 +72,7 @@ pub const SNAPSHOT_FULL_SNAPSHOT_SLOT_FILENAME: &str = "full_snapshot_slot";
 pub const BANK_SNAPSHOTS_DIR: &str = "snapshots";
 pub const MAX_SNAPSHOT_DATA_FILE_SIZE: u64 = 32 * 1024 * 1024 * 1024; // 32 GiB
 const MAX_SNAPSHOT_VERSION_FILE_SIZE: u64 = 8; // byte
+const SNAPSHOT_FASTBOOT_VERSION: Version = Version::new(1, 0, 0);
 const VERSION_STRING_V1_2_0: &str = "1.2.0";
 pub const TMP_SNAPSHOT_ARCHIVE_PREFIX: &str = "tmp-snapshot-archive-";
 pub const DEFAULT_FULL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS: NonZeroU64 =
@@ -148,6 +151,8 @@ pub struct BankSnapshotInfo {
     pub snapshot_dir: PathBuf,
     /// Snapshot version
     pub snapshot_version: SnapshotVersion,
+    /// Fastboot version
+    pub fastboot_version: Option<Version>,
 }
 
 impl PartialOrd for BankSnapshotInfo {
@@ -182,10 +187,15 @@ impl BankSnapshotInfo {
         // I/O errors.
 
         // There is a time window from the slot directory being created, and the content being completely
-        // filled.  Check the completion to avoid using a highest found slot directory with missing content.
-        if !is_bank_snapshot_complete(&bank_snapshot_dir) {
-            return Err(SnapshotNewFromDirError::IncompleteDir(bank_snapshot_dir));
-        }
+        // filled.  Check the version file as it is the last file written to avoid using a highest
+        // found slot directory with missing content
+        let version_path = bank_snapshot_dir.join(SNAPSHOT_VERSION_FILENAME);
+        let version_str = snapshot_version_from_file(&version_path).map_err(|err| {
+            SnapshotNewFromDirError::IncompleteDir(err, bank_snapshot_dir.clone())
+        })?;
+
+        let snapshot_version = SnapshotVersion::from_str(version_str.as_str())
+            .or(Err(SnapshotNewFromDirError::InvalidVersion(version_str)))?;
 
         let status_cache_file = bank_snapshot_dir.join(SNAPSHOT_STATUS_CACHE_FILENAME);
         if !status_cache_file.is_file() {
@@ -194,13 +204,6 @@ impl BankSnapshotInfo {
             ));
         }
 
-        let version_path = bank_snapshot_dir.join(SNAPSHOT_VERSION_FILENAME);
-        let version_str = snapshot_version_from_file(&version_path).or(Err(
-            SnapshotNewFromDirError::MissingVersionFile(version_path),
-        ))?;
-        let snapshot_version = SnapshotVersion::from_str(version_str.as_str())
-            .or(Err(SnapshotNewFromDirError::InvalidVersion(version_str)))?;
-
         let bank_snapshot_path = bank_snapshot_dir.join(get_snapshot_file_name(slot));
         if !bank_snapshot_path.is_file() {
             return Err(SnapshotNewFromDirError::MissingSnapshotFile(
@@ -208,10 +211,25 @@ impl BankSnapshotInfo {
             ));
         };
 
+        let snapshot_fastboot_version_path =
+            bank_snapshot_dir.join(SNAPSHOT_FASTBOOT_VERSION_FILENAME);
+
+        // If the version file is absent, fastboot_version will be None. This allows versions 3.1+
+        // to load snapshots created by versions <3.1. In version 3.2, the version file will become
+        // mandatory, and its absence can be treated as an error.
+        let fastboot_version = fs::read_to_string(&snapshot_fastboot_version_path)
+            .ok()
+            .map(|version_string| {
+                Version::from_str(version_string.trim())
+                    .map_err(|_| SnapshotNewFromDirError::InvalidFastbootVersion(version_string))
+            })
+            .transpose()?;
+
         Ok(BankSnapshotInfo {
             slot,
             snapshot_dir: bank_snapshot_dir,
             snapshot_version,
+            fastboot_version,
         })
     }
 
@@ -335,6 +353,12 @@ pub enum SnapshotError {
     #[error("snapshot hash mismatch: deserialized bank: {0:?}, snapshot archive: {1:?}")]
     MismatchedHash(SnapshotHash, SnapshotHash),
 
+    #[error(
+        "snapshot accounts file id mismatch: deserialized obsolete accounts file id: {0}, \
+         snapshot archive: {1}"
+    )]
+    MismatchedAccountsFileId(SerializedAccountsFileId, SerializedAccountsFileId),
+
     #[error("snapshot slot deltas are invalid: {0}")]
     VerifySlotDeltas(#[from] VerifySlotDeltasError),
 
@@ -370,6 +394,12 @@ pub enum SnapshotError {
 }
 
 #[derive(Error, Debug)]
+pub enum SnapshotFastbootError {
+    #[error("incompatible fastboot version '{0}'")]
+    IncompatibleVersion(Version),
+}
+
+#[derive(Error, Debug)]
 pub enum SnapshotNewFromDirError {
     #[error("invalid bank snapshot directory '{0}'")]
     InvalidBankSnapshotDir(PathBuf),
@@ -383,8 +413,11 @@ pub enum SnapshotNewFromDirError {
     #[error("invalid snapshot version '{0}'")]
     InvalidVersion(String),
 
-    #[error("snapshot directory incomplete '{0}'")]
-    IncompleteDir(PathBuf),
+    #[error("invalid version string for fastboot '{0}'")]
+    InvalidFastbootVersion(String),
+
+    #[error("snapshot directory incomplete '{1}': {0}")]
+    IncompleteDir(#[source] IoError, PathBuf),
 
     #[error("missing snapshot file '{0}'")]
     MissingSnapshotFile(PathBuf),
@@ -449,9 +482,6 @@ pub enum AddBankSnapshotError {
     #[error("failed to flush storage '{1}': {0}")]
     FlushStorage(#[source] AccountsFileError, PathBuf),
 
-    #[error("failed to mark snapshot storages as 'flushed': {0}")]
-    MarkStoragesFlushed(#[source] IoError),
-
     #[error("failed to hard link storages: {0}")]
     HardLinkStorages(#[source] HardLinkStoragesToSnapshotError),
 
@@ -464,8 +494,8 @@ pub enum AddBankSnapshotError {
     #[error("failed to write snapshot version file '{1}': {0}")]
     WriteSnapshotVersionFile(#[source] IoError, PathBuf),
 
-    #[error("failed to mark snapshot as 'complete': {0}")]
-    MarkSnapshotComplete(#[source] IoError),
+    #[error("failed to mark snapshot as 'loadable': {0}")]
+    MarkSnapshotLoadable(#[source] IoError),
 }
 
 /// Errors that can happen in `archive_snapshot_package()`
@@ -647,24 +677,8 @@ pub fn purge_incomplete_bank_snapshots(bank_snapshots_dir: impl AsRef<Path>) {
 
 /// Is the bank snapshot complete?
 fn is_bank_snapshot_complete(bank_snapshot_dir: impl AsRef<Path>) -> bool {
-    let state_complete_path = bank_snapshot_dir
-        .as_ref()
-        .join(SNAPSHOT_STATE_COMPLETE_FILENAME);
-    state_complete_path.is_file()
-}
-
-/// Marks the bank snapshot as complete
-fn write_snapshot_state_complete_file(bank_snapshot_dir: impl AsRef<Path>) -> io::Result<()> {
-    let state_complete_path = bank_snapshot_dir
-        .as_ref()
-        .join(SNAPSHOT_STATE_COMPLETE_FILENAME);
-    fs::File::create(&state_complete_path).map_err(|err| {
-        IoError::other(format!(
-            "failed to create file '{}': {err}",
-            state_complete_path.display(),
-        ))
-    })?;
-    Ok(())
+    let version_path = bank_snapshot_dir.as_ref().join(SNAPSHOT_VERSION_FILENAME);
+    version_path.is_file()
 }
 
 /// Writes the full snapshot slot file into the bank snapshot dir
@@ -710,8 +724,22 @@ pub fn read_full_snapshot_slot_file(bank_snapshot_dir: impl AsRef<Path>) -> io::
     Ok(slot)
 }
 
-/// Writes the 'snapshot storages have been flushed' file to the bank snapshot dir
-pub fn write_storages_flushed_file(bank_snapshot_dir: impl AsRef<Path>) -> io::Result<()> {
+/// Writes files that indicate the bank snapshot is loadable by fastboot
+pub fn mark_bank_snapshot_as_loadable(bank_snapshot_dir: impl AsRef<Path>) -> io::Result<()> {
+    // Mark this directory complete. Used in older versions to check if the snapshot is complete
+    // Never read in v3.1, can be removed in v3.2
+    let state_complete_path = bank_snapshot_dir
+        .as_ref()
+        .join(SNAPSHOT_STATE_COMPLETE_FILENAME);
+    fs::File::create(&state_complete_path).map_err(|err| {
+        IoError::other(format!(
+            "failed to create file '{}': {err}",
+            state_complete_path.display(),
+        ))
+    })?;
+
+    // Write the storages flushed file. Used in older versions to check if the snapshot is complete
+    // Read in v3.1 for backwards compatibility, can be removed in v3.2
     let flushed_storages_path = bank_snapshot_dir
         .as_ref()
         .join(SNAPSHOT_STORAGES_FLUSHED_FILENAME);
@@ -721,15 +749,54 @@ pub fn write_storages_flushed_file(bank_snapshot_dir: impl AsRef<Path>) -> io::R
             flushed_storages_path.display(),
         ))
     })?;
+
+    let snapshot_fastboot_version_path = bank_snapshot_dir
+        .as_ref()
+        .join(SNAPSHOT_FASTBOOT_VERSION_FILENAME);
+    fs::write(
+        &snapshot_fastboot_version_path,
+        SNAPSHOT_FASTBOOT_VERSION.to_string(),
+    )
+    .map_err(|err| {
+        IoError::other(format!(
+            "failed to write fastboot version file '{}': {err}",
+            snapshot_fastboot_version_path.display(),
+        ))
+    })?;
     Ok(())
 }
 
-/// Were the snapshot storages flushed in this bank snapshot?
-fn are_bank_snapshot_storages_flushed(bank_snapshot_dir: impl AsRef<Path>) -> bool {
+/// Is this bank snapshot loadable?
+fn is_bank_snapshot_loadable(
+    bank_snapshot_dir: impl AsRef<Path>,
+    fastboot_version: Option<&Version>,
+) -> std::result::Result<bool, SnapshotFastbootError> {
+    // Legacy storages flushed file
+    // Read in v3.1 for backwards compatibility, can be removed in v3.2
     let flushed_storages = bank_snapshot_dir
         .as_ref()
         .join(SNAPSHOT_STORAGES_FLUSHED_FILENAME);
-    flushed_storages.is_file()
+    if flushed_storages.is_file() {
+        return Ok(true);
+    }
+
+    if let Some(fastboot_version) = fastboot_version {
+        is_snapshot_fastboot_compatible(fastboot_version)
+    } else {
+        // No fastboot version file, so this is not a fastbootable
+        Ok(false)
+    }
+}
+
+/// Is the fastboot snapshot version compatible?
+fn is_snapshot_fastboot_compatible(
+    version: &Version,
+) -> std::result::Result<bool, SnapshotFastbootError> {
+    if version.major <= SNAPSHOT_FASTBOOT_VERSION.major {
+        Ok(true)
+    } else {
+        Err(SnapshotFastbootError::IncompatibleVersion(version.clone()))
+    }
 }
 
 /// Gets the highest, loadable, bank snapshot
@@ -740,9 +807,22 @@ pub fn get_highest_loadable_bank_snapshot(
 ) -> Option<BankSnapshotInfo> {
     let highest_bank_snapshot = get_highest_bank_snapshot(&snapshot_config.bank_snapshots_dir)?;
 
-    let are_storages_flushed =
-        are_bank_snapshot_storages_flushed(&highest_bank_snapshot.snapshot_dir);
-    are_storages_flushed.then_some(highest_bank_snapshot)
+    let is_bank_snapshot_loadable = is_bank_snapshot_loadable(
+        &highest_bank_snapshot.snapshot_dir,
+        highest_bank_snapshot.fastboot_version.as_ref(),
+    );
+
+    match is_bank_snapshot_loadable {
+        Ok(true) => Some(highest_bank_snapshot),
+        Ok(false) => None,
+        Err(err) => {
+            warn!(
+                "Bank snapshot is not loadable '{}': {err}",
+                highest_bank_snapshot.snapshot_dir.display()
+            );
+            None
+        }
+    }
 }
 
 /// If the validator halts in the middle of `archive_snapshot_package()`, the temporary staging
@@ -885,28 +965,6 @@ fn serialize_snapshot(
             bank_snapshot_path.display(),
         );
 
-        let (flush_storages_us, hard_link_storages_us) = if should_flush_and_hard_link_storages {
-            let flush_measure = Measure::start("");
-            for storage in snapshot_storages {
-                storage.flush().map_err(|err| {
-                    AddBankSnapshotError::FlushStorage(err, storage.path().to_path_buf())
-                })?;
-            }
-            let flush_us = flush_measure.end_as_us();
-            let (_, hard_link_us) = measure_us!(hard_link_storages_to_snapshot(
-                &bank_snapshot_dir,
-                slot,
-                snapshot_storages
-            )
-            .map_err(AddBankSnapshotError::HardLinkStorages)?);
-            write_storages_flushed_file(&bank_snapshot_dir)
-                .map_err(AddBankSnapshotError::MarkStoragesFlushed)?;
-            Some((flush_us, hard_link_us))
-        } else {
-            None
-        }
-        .unzip();
-
         let bank_snapshot_serializer = move |stream: &mut BufWriter<fs::File>| -> Result<()> {
             let versioned_epoch_stakes = mem::take(&mut bank_fields.versioned_epoch_stakes);
             let extra_fields = ExtraFieldsToSerialize {
@@ -945,12 +1003,30 @@ fn serialize_snapshot(
         )
         .map_err(|err| AddBankSnapshotError::WriteSnapshotVersionFile(err, version_path))?);
 
-        // Mark this directory complete so it can be used.  Check this flag first before selecting for deserialization.
-        let (_, write_state_complete_file_us) = measure_us!({
-            write_snapshot_state_complete_file(&bank_snapshot_dir)
-                .map_err(AddBankSnapshotError::MarkSnapshotComplete)?
-        });
+        let (flush_storages_us, hard_link_storages_us) = if should_flush_and_hard_link_storages {
+            let flush_measure = Measure::start("");
+            for storage in snapshot_storages {
+                storage.flush().map_err(|err| {
+                    AddBankSnapshotError::FlushStorage(err, storage.path().to_path_buf())
+                })?;
+            }
+            let flush_us = flush_measure.end_as_us();
+            let (_, hard_link_us) = measure_us!(hard_link_storages_to_snapshot(
+                &bank_snapshot_dir,
+                slot,
+                snapshot_storages
+            )
+            .map_err(AddBankSnapshotError::HardLinkStorages)?);
 
+            // Now that the storages are flushed and hard linked, mark the snapshot as loadable
+            mark_bank_snapshot_as_loadable(&bank_snapshot_dir)
+                .map_err(AddBankSnapshotError::MarkSnapshotLoadable)?;
+
+            Some((flush_us, hard_link_us))
+        } else {
+            None
+        }
+        .unzip();
         measure_everything.stop();
 
         // Monitor sizes because they're capped to MAX_SNAPSHOT_DATA_FILE_SIZE
@@ -964,11 +1040,6 @@ fn serialize_snapshot(
             ("bank_serialize_us", bank_serialize.as_us(), i64),
             ("status_cache_serialize_us", status_cache_serialize_us, i64),
             ("write_version_file_us", write_version_file_us, i64),
-            (
-                "write_state_complete_file_us",
-                write_state_complete_file_us,
-                i64
-            ),
             ("total_us", measure_everything.as_us(), i64),
         );
 
@@ -983,6 +1054,7 @@ fn serialize_snapshot(
             slot,
             snapshot_dir: bank_snapshot_dir,
             snapshot_version,
+            fastboot_version: None,
         })
     };
 
@@ -1765,8 +1837,6 @@ fn create_snapshot_meta_files_for_unarchived_snapshot(unpack_dir: impl AsRef<Pat
         slot_dir.join(SNAPSHOT_STATUS_CACHE_FILENAME),
     )?;
 
-    write_snapshot_state_complete_file(slot_dir)?;
-
     Ok(())
 }
 
@@ -1816,6 +1886,7 @@ fn unarchive_snapshot(
                     next_append_vec_id,
                     SnapshotFrom::Archive,
                     accounts_db_config.storage_access,
+                    None,
                 )?,
                 measure_name
             );
@@ -1954,6 +2025,7 @@ pub fn rebuild_storages_from_snapshot_dir(
         next_append_vec_id,
         SnapshotFrom::Dir,
         storage_access,
+        None,
     )?;
 
     Ok((storage, bank_fields, accounts_db_fields))
@@ -1962,7 +2034,7 @@ pub fn rebuild_storages_from_snapshot_dir(
 /// Reads the `snapshot_version` from a file. Before opening the file, its size
 /// is compared to `MAX_SNAPSHOT_VERSION_FILE_SIZE`. If the size exceeds this
 /// threshold, it is not opened and an error is returned.
-fn snapshot_version_from_file(path: impl AsRef<Path>) -> Result<String> {
+fn snapshot_version_from_file(path: impl AsRef<Path>) -> io::Result<String> {
     // Check file size.
     let file_metadata = fs::metadata(&path).map_err(|err| {
         IoError::other(format!(
@@ -1978,7 +2050,7 @@ fn snapshot_version_from_file(path: impl AsRef<Path>) -> Result<String> {
             file_size,
             MAX_SNAPSHOT_VERSION_FILE_SIZE,
         );
-        return Err(IoError::other(error_message).into());
+        return Err(IoError::other(error_message));
     }
 
     // Read snapshot_version from file.
@@ -2498,6 +2570,7 @@ pub fn create_tmp_accounts_dir_for_tests() -> (TempDir, PathBuf) {
 mod tests {
     use {
         super::*,
+        agave_snapshots::ZstdConfig,
         assert_matches::assert_matches,
         bincode::{deserialize_from, serialize_into},
         std::{convert::TryFrom, mem::size_of},
@@ -2653,7 +2726,7 @@ mod tests {
         file.write_all(&file_content).unwrap();
         assert_matches!(
             snapshot_version_from_file(file.path()),
-            Err(SnapshotError::Io(ref message)) if message.to_string().starts_with("snapshot version file too large")
+            Err(ref message) if message.to_string().starts_with("snapshot version file too large")
         );
     }
 
@@ -2857,9 +2930,6 @@ mod tests {
 
             let version_path = snapshot_dir.join(SNAPSHOT_VERSION_FILENAME);
             fs::write(version_path, SnapshotVersion::default().as_str().as_bytes()).unwrap();
-
-            // Mark this directory complete so it can be used.  Check this flag first before selecting for deserialization.
-            write_snapshot_state_complete_file(snapshot_dir).unwrap();
         }
     }
 

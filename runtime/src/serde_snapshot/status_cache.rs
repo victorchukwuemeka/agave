@@ -1,17 +1,18 @@
 //! Serialize and deserialize the status cache for snapshots
 
+#[cfg(feature = "shuttle-test")]
+use shuttle::sync::Mutex;
+#[cfg(not(feature = "shuttle-test"))]
+use std::sync::Mutex;
 use {
     crate::{bank::BankSlotDelta, snapshot_utils, status_cache::KeySlice},
     bincode::{self, Options as _},
+    serde::{Deserialize, Serialize},
     solana_clock::Slot,
     solana_hash::Hash,
     solana_instruction::error::InstructionError,
     solana_transaction_error::TransactionError,
-    std::{
-        collections::HashMap,
-        path::Path,
-        sync::{Arc, Mutex},
-    },
+    std::{collections::HashMap, path::Path, sync::Arc},
 };
 
 #[cfg_attr(

@@ -6,6 +6,7 @@ use {
         commands::{run::args::RunArgs, FromClapArgMatches},
         ledger_lockfile, lock_ledger,
     },
+    agave_snapshots::{ArchiveFormat, SnapshotInterval},
     clap::{crate_name, value_t, value_t_or_exit, values_t, values_t_or_exit, ArgMatches},
     crossbeam_channel::unbounded,
     log::*,
@@ -25,6 +26,7 @@ use {
     },
     solana_clock::{Slot, DEFAULT_SLOTS_PER_EPOCH},
     solana_core::{
+        banking_stage::transaction_scheduler::scheduler_controller::SchedulerConfig,
         banking_trace::DISABLED_BAKING_TRACE_DIR,
         consensus::tower_storage,
         repair::repair_handler::RepairHandlerType,
@@ -32,8 +34,8 @@ use {
         system_monitor_service::SystemMonitorService,
         validator::{
             is_snapshot_config_valid, BlockProductionMethod, BlockVerificationMethod,
-            TransactionStructure, Validator, ValidatorConfig, ValidatorError,
-            ValidatorStartProgress, ValidatorTpuConfig,
+            SchedulerPacing, Validator, ValidatorConfig, ValidatorError, ValidatorStartProgress,
+            ValidatorTpuConfig,
         },
     },
     solana_gossip::{
@@ -55,9 +57,7 @@ use {
     solana_runtime::{
         runtime_config::RuntimeConfig,
         snapshot_config::{SnapshotConfig, SnapshotUsage},
-        snapshot_utils::{
-            self, ArchiveFormat, SnapshotInterval, SnapshotVersion, BANK_SNAPSHOTS_DIR,
-        },
+        snapshot_utils::{self, SnapshotVersion, BANK_SNAPSHOTS_DIR},
     },
     solana_signer::Signer,
     solana_streamer::quic::{QuicServerParams, DEFAULT_TPU_COALESCE},
@@ -89,7 +89,6 @@ pub enum Operation {
 pub fn execute(
     matches: &ArgMatches,
     solana_version: &str,
-    ledger_path: &Path,
     operation: Operation,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let run_args = RunArgs::from_clap_arg_match(matches)?;
@@ -165,13 +164,7 @@ pub fn execute(
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_TPU_COALESCE);
 
-    // Canonicalize ledger path to avoid issues with symlink creation
-    let ledger_path = create_and_canonicalize_directory(ledger_path).map_err(|err| {
-        format!(
-            "unable to access ledger path '{}': {err}",
-            ledger_path.display(),
-        )
-    })?;
+    let ledger_path = run_args.ledger_path;
 
     let max_ledger_shreds = if matches.is_present("limit_ledger_size") {
         let limit_ledger_size = match matches.value_of("limit_ledger_size") {
@@ -231,6 +224,13 @@ pub fn execute(
     if bind_addresses.len() > 1 && matches.is_present("use_connection_cache") {
         Err(String::from(
             "Connection cache can not be used in a multihoming context",
+        ))?;
+    }
+
+    if bind_addresses.len() > 1 && matches.is_present("advertised_ip") {
+        Err(String::from(
+            "--advertised-ip cannot be used in a multihoming context. In multihoming, the \
+             validator will advertise the first --bind-address as this node's public IP address.",
         ))?;
     }
 
@@ -309,7 +309,7 @@ pub fn execute(
         accounts_index_config.bins = Some(bins);
     }
 
-    accounts_index_config.index_limit_mb = if matches.is_present("disable_accounts_disk_index") {
+    accounts_index_config.index_limit_mb = if !matches.is_present("enable_accounts_disk_index") {
         IndexLimitMb::InMemOnly
     } else {
         IndexLimitMb::Minimal
@@ -568,6 +568,9 @@ pub fn execute(
         no_os_network_stats_reporting: matches.is_present("no_os_network_stats_reporting"),
         no_os_cpu_stats_reporting: matches.is_present("no_os_cpu_stats_reporting"),
         no_os_disk_stats_reporting: matches.is_present("no_os_disk_stats_reporting"),
+        // The validator needs to open many files, check that the process has
+        // permission to do so in order to fail quickly and give a direct error
+        enforce_ulimit_nofile: true,
         poh_pinned_cpu_core: value_of(matches, "poh_pinned_cpu_core")
             .unwrap_or(poh_service::DEFAULT_PINNED_CPU_CORE),
         poh_hashes_per_batch: value_of(matches, "poh_hashes_per_batch")
@@ -618,7 +621,13 @@ pub fn execute(
             BlockProductionMethod
         ),
         block_production_num_workers,
-        transaction_struct: value_t_or_exit!(matches, "transaction_struct", TransactionStructure),
+        block_production_scheduler_config: SchedulerConfig {
+            scheduler_pacing: value_t_or_exit!(
+                matches,
+                "block_production_pacing_fill_time_millis",
+                SchedulerPacing
+            ),
+        },
         enable_block_production_forwarding: staked_nodes_overrides_path.is_some(),
         banking_trace_dir_byte_limit: parse_banking_trace_dir_byte_limit(matches),
         validator_exit: Arc::new(RwLock::new(Exit::default())),
@@ -735,8 +744,18 @@ pub fn execute(
         })
         .transpose()?;
 
+    let advertised_ip = matches
+        .value_of("advertised_ip")
+        .map(|advertised_ip| {
+            solana_net_utils::parse_host(advertised_ip)
+                .map_err(|err| format!("failed to parse --advertised-ip: {err}"))
+        })
+        .transpose()?;
+
     let advertised_ip = if let Some(ip) = gossip_host {
         ip
+    } else if let Some(cli_ip) = advertised_ip {
+        cli_ip
     } else if !bind_addresses.active().is_unspecified() && !bind_addresses.active().is_loopback() {
         bind_addresses.active()
     } else if !entrypoint_addrs.is_empty() {
@@ -821,7 +840,7 @@ pub fn execute(
         advertised_ip,
         gossip_port,
         port_range: dynamic_port_range,
-        bind_ip_addrs: Arc::new(bind_addresses),
+        bind_ip_addrs: bind_addresses,
         public_tpu_addr,
         public_tpu_forwards_addr,
         num_tvu_receive_sockets: tvu_receive_threads,
@@ -1135,11 +1154,10 @@ fn new_snapshot_config(
         }
     }
 
-    let snapshots_dir = if let Some(snapshots) = matches.value_of("snapshots") {
-        Path::new(snapshots)
-    } else {
-        ledger_path
-    };
+    let snapshots_dir = matches
+        .value_of("snapshots")
+        .map(Path::new)
+        .unwrap_or(ledger_path);
     let snapshots_dir = create_and_canonicalize_directory(snapshots_dir).map_err(|err| {
         format!(
             "failed to create snapshots directory '{}': {err}",
@@ -1165,12 +1183,10 @@ fn new_snapshot_config(
         )
     })?;
 
-    let full_snapshot_archives_dir =
-        if let Some(full_snapshot_archive_path) = matches.value_of("full_snapshot_archive_path") {
-            PathBuf::from(full_snapshot_archive_path)
-        } else {
-            snapshots_dir.clone()
-        };
+    let full_snapshot_archives_dir = matches
+        .value_of("full_snapshot_archive_path")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| snapshots_dir.clone());
     fs::create_dir_all(&full_snapshot_archives_dir).map_err(|err| {
         format!(
             "failed to create full snapshot archives directory '{}': {err}",
@@ -1178,13 +1194,10 @@ fn new_snapshot_config(
         )
     })?;
 
-    let incremental_snapshot_archives_dir = if let Some(incremental_snapshot_archive_path) =
-        matches.value_of("incremental_snapshot_archive_path")
-    {
-        PathBuf::from(incremental_snapshot_archive_path)
-    } else {
-        snapshots_dir.clone()
-    };
+    let incremental_snapshot_archives_dir = matches
+        .value_of("incremental_snapshot_archive_path")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| snapshots_dir.clone());
     fs::create_dir_all(&incremental_snapshot_archives_dir).map_err(|err| {
         format!(
             "failed to create incremental snapshot archives directory '{}': {err}",

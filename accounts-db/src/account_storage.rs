@@ -6,7 +6,7 @@ use {
     rand::seq::SliceRandom,
     rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator},
     solana_clock::Slot,
-    solana_nohash_hasher::{BuildNoHashHasher, IntMap},
+    solana_nohash_hasher::IntMap,
     std::{
         ops::{Index, Range},
         sync::{
@@ -18,7 +18,7 @@ use {
 
 pub mod stored_account_info;
 
-pub type AccountStorageMap = DashMap<Slot, Arc<AccountStorageEntry>, BuildNoHashHasher<Slot>>;
+pub type AccountStorageMap = DashMap<Slot, Arc<AccountStorageEntry>>;
 
 #[derive(Default, Debug)]
 pub struct AccountStorage {
@@ -133,7 +133,7 @@ impl AccountStorage {
     pub fn initialize(&mut self, all_storages: AccountStorageMap) {
         assert!(self.map.is_empty());
         assert!(self.no_shrink_in_progress());
-        self.map.extend(all_storages)
+        self.map = all_storages;
     }
 
     /// remove the append vec at 'slot'
@@ -228,7 +228,7 @@ impl AccountStorage {
 
 /// iterate contents of AccountStorage without exposing internals
 pub struct AccountStorageIter<'a> {
-    iter: dashmap::iter::Iter<'a, Slot, Arc<AccountStorageEntry>, BuildNoHashHasher<Slot>>,
+    iter: dashmap::iter::Iter<'a, Slot, Arc<AccountStorageEntry>>,
 }
 
 impl<'a> AccountStorageIter<'a> {

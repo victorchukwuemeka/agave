@@ -24,6 +24,7 @@ use {
         distributions::{Distribution, WeightedError, WeightedIndex},
         Rng,
     },
+    serde::{Deserialize, Serialize},
     solana_clock::Slot,
     solana_cluster_type::ClusterType,
     solana_gossip::{
@@ -229,7 +230,7 @@ type PingCache = ping_pong::PingCache<REPAIR_PING_TOKEN_SIZE>;
 #[cfg_attr(
     feature = "frozen-abi",
     derive(AbiEnumVisitor, AbiExample),
-    frozen_abi(digest = "FGw38CCo7vg24qxe7TfGP11WdX2poe6T55BGN1r3XMFA")
+    frozen_abi(digest = "fFcqrZWZX4WcorTUxfMCVWeh2QcwamXKdLTzsDj58Kn")
 )]
 #[derive(Debug, Deserialize, Serialize)]
 pub enum RepairProtocol {
@@ -1838,7 +1839,7 @@ mod tests {
             &keypair,
             &[],
             true,
-            Some(Hash::default()),
+            Hash::default(),
             index as u32,
             index as u32,
             &reed_solomon_cache,
@@ -2277,7 +2278,7 @@ mod tests {
                 &keypair,
                 &[],
                 true,
-                Some(Hash::default()),
+                Hash::default(),
                 0,
                 0,
                 &reed_solomon_cache,

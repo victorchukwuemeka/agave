@@ -69,7 +69,7 @@ macro_rules! with_mock_invoke_context {
         );
         $invoke_context
             .transaction_context
-            .configure_next_instruction_for_tests(1, instruction_accounts, &[])
+            .configure_next_instruction_for_tests(1, instruction_accounts, vec![])
             .unwrap();
         $invoke_context.push().unwrap();
     };
@@ -232,6 +232,7 @@ fn bench_create_vm(bencher: &mut Bencher) {
     let stricter_abi_and_runtime_constraints = invoke_context
         .get_feature_set()
         .stricter_abi_and_runtime_constraints;
+    let account_data_direct_mapping = invoke_context.get_feature_set().account_data_direct_mapping;
     let raise_cpi_nesting_limit_to_8 = invoke_context
         .get_feature_set()
         .raise_cpi_nesting_limit_to_8;
@@ -248,14 +249,14 @@ fn bench_create_vm(bencher: &mut Bencher) {
     executable.verify::<RequisiteVerifier>().unwrap();
 
     // Serialize account data
-    let (_serialized, regions, account_lengths) = serialize_parameters(
+    let (_serialized, regions, account_lengths, _instruction_data_offset) = serialize_parameters(
         &invoke_context
             .transaction_context
             .get_current_instruction_context()
             .unwrap(),
         stricter_abi_and_runtime_constraints,
-        false, // account_data_direct_mapping
-        true,  // mask_out_rent_epoch_in_vm_serialization
+        account_data_direct_mapping,
+        true, // mask_out_rent_epoch_in_vm_serialization
     )
     .unwrap();
 
@@ -281,16 +282,17 @@ fn bench_instruction_count_tuner(_bencher: &mut Bencher) {
     let stricter_abi_and_runtime_constraints = invoke_context
         .get_feature_set()
         .stricter_abi_and_runtime_constraints;
+    let account_data_direct_mapping = invoke_context.get_feature_set().account_data_direct_mapping;
 
     // Serialize account data
-    let (_serialized, regions, account_lengths) = serialize_parameters(
+    let (_serialized, regions, account_lengths, _instruction_data_offset) = serialize_parameters(
         &invoke_context
             .transaction_context
             .get_current_instruction_context()
             .unwrap(),
         stricter_abi_and_runtime_constraints,
-        false, // account_data_direct_mapping
-        true,  // mask_out_rent_epoch_in_vm_serialization
+        account_data_direct_mapping,
+        true, // mask_out_rent_epoch_in_vm_serialization
     )
     .unwrap();
 

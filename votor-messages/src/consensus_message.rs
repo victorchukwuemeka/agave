@@ -16,7 +16,7 @@ pub type Block = (Slot, Hash);
 #[cfg_attr(
     feature = "frozen-abi",
     derive(AbiExample),
-    frozen_abi(digest = "B6rf5Zh4zcGhKdxKVpW6An4Ns2yujVqGvAK6cM5YGFhP")
+    frozen_abi(digest = "5SPmMTisBngyvNzKsXYbo1rbhefNYeGAgVJSYF5Su6N5")
 )]
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 /// BLS vote message, we need rank to look up pubkey
@@ -140,7 +140,7 @@ impl Certificate {
 #[cfg_attr(
     feature = "frozen-abi",
     derive(AbiExample),
-    frozen_abi(digest = "2mt3bVxZBf2QzS7uZknbgP7kun4eEfzjpbW7QwXqz6Qo")
+    frozen_abi(digest = "4pnAg6WpCFLfDL8w3uujV6k7uqw3RThCLQiD6whTxhbN")
 )]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 /// BLS vote message, we need rank to look up pubkey
@@ -156,7 +156,7 @@ pub struct CertificateMessage {
 #[cfg_attr(
     feature = "frozen-abi",
     derive(AbiExample, AbiEnumVisitor),
-    frozen_abi(digest = "CwKtX5nWfGbQZSBh1YTr3NABwThE4zFTxzQL9K5xkqYW")
+    frozen_abi(digest = "AusWCevDpUnnKrAjJg7NgsiZZn5pTXaLUghGfPHrsAFA")
 )]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]

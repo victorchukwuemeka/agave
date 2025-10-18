@@ -131,8 +131,8 @@ pub fn load_and_process_ledger(
 ) -> Result<LoadAndProcessLedgerOutput, LoadAndProcessLedgerError> {
     let mut starting_slot = 0; // default start check with genesis
     let snapshot_config = {
-        let snapshots_dir = value_t!(arg_matches, "snapshots", String)
-            .ok()
+        let snapshots_dir = arg_matches
+            .value_of("snapshots")
             .map(PathBuf::from)
             .unwrap_or_else(|| blockstore.ledger_path().to_path_buf());
         let bank_snapshots_dir = if blockstore.is_primary_access() {
@@ -143,16 +143,14 @@ pub fn load_and_process_ledger(
                 .join(LEDGER_TOOL_DIRECTORY)
                 .join(BANK_SNAPSHOTS_DIR)
         };
-        let full_snapshot_archives_dir =
-            value_t!(arg_matches, "full_snapshot_archive_path", String)
-                .ok()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| snapshots_dir.clone());
-        let incremental_snapshot_archives_dir =
-            value_t!(arg_matches, "incremental_snapshot_archive_path", String)
-                .ok()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| snapshots_dir.clone());
+        let full_snapshot_archives_dir = arg_matches
+            .value_of("full_snapshot_archive_path")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| snapshots_dir.clone());
+        let incremental_snapshot_archives_dir = arg_matches
+            .value_of("incremental_snapshot_archive_path")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| snapshots_dir.clone());
         if let Some(full_snapshot_slot) =
             snapshot_utils::get_highest_full_snapshot_archive_slot(&full_snapshot_archives_dir)
         {
@@ -438,14 +436,12 @@ pub fn open_blockstore(
         .value_of("wal_recovery_mode")
         .map(BlockstoreRecoveryMode::from);
     let force_update_to_open = matches.is_present("force_update_to_open");
-    let enforce_ulimit_nofile = !matches.is_present("ignore_ulimit_nofile_error");
 
     match Blockstore::open_with_options(
         ledger_path,
         BlockstoreOptions {
             access_type: access_type.clone(),
             recovery_mode: wal_recovery_mode.clone(),
-            enforce_ulimit_nofile,
             ..BlockstoreOptions::default()
         },
     ) {
@@ -519,7 +515,6 @@ fn open_blockstore_with_temporary_primary_access(
             BlockstoreOptions {
                 access_type: AccessType::PrimaryForMaintenance,
                 recovery_mode: wal_recovery_mode.clone(),
-                enforce_ulimit_nofile: true,
                 ..BlockstoreOptions::default()
             },
         )?;
@@ -533,7 +528,6 @@ fn open_blockstore_with_temporary_primary_access(
         BlockstoreOptions {
             access_type: original_access_type,
             recovery_mode: wal_recovery_mode,
-            enforce_ulimit_nofile: true,
             ..BlockstoreOptions::default()
         },
     )

@@ -14,7 +14,6 @@ use solana_program_runtime::memory::translate_vm_slice;
 #[allow(deprecated)]
 use {
     crate::mem_ops::is_nonoverlapping,
-    solana_account_info::AccountInfo,
     solana_big_mod_exp::{big_mod_exp, BigModExpParams},
     solana_blake3_hasher as blake3,
     solana_bn254::prelude::{
@@ -63,9 +62,6 @@ mod cpi;
 mod logging;
 mod mem_ops;
 mod sysvar;
-
-/// Maximum signers
-const MAX_SIGNERS: usize = 16;
 
 /// Error definitions
 #[derive(Debug, ThisError, PartialEq, Eq)]
@@ -323,7 +319,7 @@ pub fn create_program_runtime_environment_v1<'a>(
         enable_stack_frame_gaps: true,
         instruction_meter_checkpoint_distance: 10000,
         enable_instruction_meter: true,
-        enable_instruction_tracing: debugging_features,
+        enable_register_tracing: debugging_features,
         enable_symbol_and_section_labels: debugging_features,
         reject_broken_elfs: reject_deployment_of_broken_elfs,
         noop_instruction_rate: 256,
@@ -524,7 +520,7 @@ pub fn create_program_runtime_environment_v2<'a>(
         enable_stack_frame_gaps: false,
         instruction_meter_checkpoint_distance: 10000,
         enable_instruction_meter: true,
-        enable_instruction_tracing: debugging_features,
+        enable_register_tracing: debugging_features,
         enable_symbol_and_section_labels: debugging_features,
         reject_broken_elfs: true,
         noop_instruction_rate: 256,
@@ -2056,6 +2052,7 @@ mod tests {
         assert_matches::assert_matches,
         core::slice,
         solana_account::{create_account_shared_data_for_test, AccountSharedData},
+        solana_account_info::AccountInfo,
         solana_clock::Clock,
         solana_epoch_rewards::EpochRewards,
         solana_epoch_schedule::EpochSchedule,
@@ -2120,7 +2117,7 @@ mod tests {
             with_mock_invoke_context!($invoke_context, transaction_context, transaction_accounts);
             $invoke_context
                 .transaction_context
-                .configure_next_instruction_for_tests(1, vec![], &[])
+                .configure_next_instruction_for_tests(1, vec![], vec![])
                 .unwrap();
             $invoke_context.push().unwrap();
         };
@@ -2525,7 +2522,6 @@ mod tests {
                 .set_syscall_context(SyscallContext {
                     allocator: BpfAllocator::new(solana_program_entrypoint::HEAP_LENGTH as u64),
                     accounts_metadata: Vec::new(),
-                    trace_log: Vec::new(),
                 })
                 .unwrap();
             let config = Config {
@@ -4354,7 +4350,7 @@ mod tests {
                     .configure_next_instruction_for_tests(
                         0,
                         instruction_accounts,
-                        &[index_in_trace as u8],
+                        vec![index_in_trace as u8],
                     )
                     .unwrap();
                 invoke_context.transaction_context.push().unwrap();

@@ -20,7 +20,7 @@ use {
 #[cfg(feature = "dev-context-only-utils")]
 use {
     bincode,
-    solana_vote_interface::state::{VoteStateV3, VoteStateVersions},
+    solana_vote_interface::state::{VoteStateV3, VoteStateV4, VoteStateVersions},
 };
 
 mod field_frames;
@@ -244,6 +244,14 @@ impl From<VoteStateV3> for VoteStateView {
     }
 }
 
+#[cfg(feature = "dev-context-only-utils")]
+impl From<VoteStateV4> for VoteStateView {
+    fn from(vote_state: VoteStateV4) -> Self {
+        let vote_account_data = bincode::serialize(&VoteStateVersions::new_v4(vote_state)).unwrap();
+        VoteStateView::try_new(Arc::new(vote_account_data)).unwrap()
+    }
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
 enum VoteStateFrame {
@@ -339,6 +347,7 @@ mod tests {
     use {
         super::*,
         arbitrary::{Arbitrary, Unstructured},
+        serde::{Deserialize, Serialize},
         solana_clock::Clock,
         solana_vote_interface::{
             authorized_voters::AuthorizedVoters,

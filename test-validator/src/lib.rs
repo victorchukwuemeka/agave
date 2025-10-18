@@ -1,6 +1,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 use {
     agave_feature_set::{alpenglow, raise_cpi_nesting_limit_to_8, FeatureSet, FEATURE_NAMES},
+    agave_snapshots::SnapshotInterval,
     base64::{prelude::BASE64_STANDARD, Engine},
     crossbeam_channel::Receiver,
     log::*,
@@ -50,7 +51,7 @@ use {
         genesis_utils::{self, create_genesis_config_with_leader_ex_no_features},
         runtime_config::RuntimeConfig,
         snapshot_config::SnapshotConfig,
-        snapshot_utils::{SnapshotInterval, BANK_SNAPSHOTS_DIR},
+        snapshot_utils::BANK_SNAPSHOTS_DIR,
     },
     solana_sdk_ids::address_lookup_table,
     solana_signer::Signer,
@@ -927,6 +928,7 @@ impl TestValidator {
             &validator_identity.pubkey(),
             &validator_vote_account.pubkey(),
             &validator_stake_account.pubkey(),
+            None,
             validator_stake_lamports,
             validator_identity_lamports,
             config.fee_rate_governor.clone(),
@@ -1026,7 +1028,7 @@ impl TestValidator {
         let node = {
             let bind_ip_addr = config.node_config.bind_ip_addr;
             let validator_node_config = NodeConfig {
-                bind_ip_addrs: Arc::new(BindIpAddrs::new(vec![bind_ip_addr])?),
+                bind_ip_addrs: BindIpAddrs::new(vec![bind_ip_addr])?,
                 gossip_port: config.node_config.gossip_addr.port(),
                 port_range: config.node_config.port_range,
                 advertised_ip: bind_ip_addr,

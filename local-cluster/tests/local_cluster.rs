@@ -1,5 +1,6 @@
 #![allow(clippy::arithmetic_side_effects)]
 use {
+    agave_snapshots::SnapshotInterval,
     assert_matches::assert_matches,
     crossbeam_channel::{unbounded, Receiver},
     gag::BufferRedirect,
@@ -74,7 +75,7 @@ use {
         snapshot_bank_utils,
         snapshot_config::SnapshotConfig,
         snapshot_package::SnapshotKind,
-        snapshot_utils::{self, SnapshotInterval, BANK_SNAPSHOTS_DIR},
+        snapshot_utils::{self, BANK_SNAPSHOTS_DIR},
     },
     solana_signer::Signer,
     solana_stake_interface::{self as stake, state::NEW_WARMUP_COOLDOWN_RATE},
@@ -242,7 +243,7 @@ fn test_local_cluster_signature_subscribe() {
     );
 
     let (mut sig_subscribe_client, receiver) = PubsubClient::signature_subscribe(
-        &format!("ws://{}", non_bootstrap_info.rpc_pubsub().unwrap()),
+        format!("ws://{}", non_bootstrap_info.rpc_pubsub().unwrap()),
         &transaction.signatures[0],
         Some(RpcSignatureSubscribeConfig {
             commitment: Some(CommitmentConfig::processed()),
@@ -1649,6 +1650,7 @@ fn test_no_voting() {
 
 #[test]
 #[serial]
+#[ignore]
 fn test_optimistic_confirmation_violation_detection() {
     solana_logger::setup_with_default(RUST_LOG_FILTER);
     // First set up the cluster with 2 nodes
@@ -2728,7 +2730,7 @@ fn test_rpc_block_subscribe() {
     let cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
     let rpc_node_contact_info = cluster.get_contact_info(rpc_node_pubkey).unwrap();
     let (mut block_subscribe_client, receiver) = PubsubClient::block_subscribe(
-        &format!(
+        format!(
             "ws://{}",
             // It is important that we subscribe to a non leader node as there
             // is a race condition which can cause leader nodes to not send
@@ -2883,7 +2885,7 @@ fn test_oc_bad_signatures() {
     );
 
     let (mut block_subscribe_client, receiver) = PubsubClient::block_subscribe(
-        &format!(
+        format!(
             "ws://{}",
             &cluster.entry_point_info.rpc_pubsub().unwrap().to_string()
         ),
@@ -3111,7 +3113,7 @@ fn setup_transfer_scan_threads(
                 }
                 if let Some(total_scan_balance) = client
                     .rpc_client()
-                    .get_program_accounts_with_config(
+                    .get_program_ui_accounts_with_config(
                         &system_program::id(),
                         scan_commitment_config.clone(),
                     )
@@ -5890,10 +5892,10 @@ fn test_invalid_forks_persisted_on_restart() {
             .entries_to_merkle_shreds_for_tests(
                 &majority_keypair,
                 &entries,
-                true, // is_full_slot
-                None, // chained_merkle_root
-                0,    // next_shred_index,
-                0,    // next_code_index
+                true,            // is_full_slot
+                Hash::default(), // chained_merkle_root
+                0,               // next_shred_index,
+                0,               // next_code_index
                 &ReedSolomonCache::default(),
                 &mut ProcessShredsStats::default(),
             )

@@ -68,7 +68,7 @@ use {
     log::*,
     partitioned_epoch_rewards::PartitionedRewardsCalculation,
     rayon::{ThreadPool, ThreadPoolBuilder},
-    serde::Serialize,
+    serde::{Deserialize, Serialize},
     solana_account::{
         create_account_shared_data_with_fields as create_account, from_account, Account,
         AccountSharedData, InheritableAccountFields, ReadableAccount, WritableAccount,
@@ -111,7 +111,8 @@ use {
     solana_packet::PACKET_DATA_SIZE,
     solana_precompile_error::PrecompileError,
     solana_program_runtime::{
-        invoke_context::BuiltinFunctionWithContext, loaded_programs::ProgramCacheEntry,
+        invoke_context::BuiltinFunctionWithContext,
+        loaded_programs::{ProgramCacheEntry, ProgramRuntimeEnvironment},
     },
     solana_pubkey::{Pubkey, PubkeyHasherBuilder},
     solana_reward_info::RewardInfo,
@@ -157,7 +158,9 @@ use {
         versioned::VersionedTransaction,
         Transaction, TransactionVerificationMode,
     },
-    solana_transaction_context::{transaction_accounts::TransactionAccount, TransactionReturnData},
+    solana_transaction_context::{
+        transaction_accounts::KeyedAccountSharedData, TransactionReturnData,
+    },
     solana_transaction_error::{TransactionError, TransactionResult as Result},
     solana_vote::vote_account::{VoteAccount, VoteAccountsHashMap},
     std::{
@@ -306,7 +309,7 @@ pub struct LoadAndExecuteTransactionsOutput {
 pub struct TransactionSimulationResult {
     pub result: Result<()>,
     pub logs: TransactionLogMessages,
-    pub post_simulation_accounts: Vec<TransactionAccount>,
+    pub post_simulation_accounts: Vec<KeyedAccountSharedData>,
     pub units_consumed: u64,
     pub loaded_accounts_data_size: u32,
     pub return_data: Option<TransactionReturnData>,
@@ -316,6 +319,25 @@ pub struct TransactionSimulationResult {
     pub post_balances: Option<Vec<u64>>,
     pub pre_token_balances: Option<Vec<SvmTokenInfo>>,
     pub post_token_balances: Option<Vec<SvmTokenInfo>>,
+}
+
+impl TransactionSimulationResult {
+    pub fn new_error(err: TransactionError) -> Self {
+        Self {
+            fee: None,
+            inner_instructions: None,
+            loaded_accounts_data_size: 0,
+            logs: vec![],
+            post_balances: None,
+            post_simulation_accounts: vec![],
+            post_token_balances: None,
+            pre_balances: None,
+            pre_token_balances: None,
+            result: Err(err),
+            return_data: None,
+            units_consumed: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1466,12 +1488,6 @@ impl Bank {
         let (_epoch, slot_index) = self.epoch_schedule.get_epoch_and_slot_index(self.slot);
         let slots_in_epoch = self.epoch_schedule.get_slots_in_epoch(self.epoch);
         let (upcoming_feature_set, _newly_activated) = self.compute_active_feature_set(true);
-        let compute_budget = self
-            .compute_budget
-            .unwrap_or(ComputeBudget::new_with_defaults(
-                upcoming_feature_set.is_active(&raise_cpi_nesting_limit_to_8::id()),
-            ))
-            .to_budget();
 
         // Recompile loaded programs one at a time before the next epoch hits
         let slots_in_recompilation_phase =
@@ -1529,27 +1545,18 @@ impl Bank {
                 .global_program_cache
                 .write()
                 .unwrap();
-            let program_runtime_environment_v1 = create_program_runtime_environment_v1(
-                &upcoming_feature_set.runtime_features(),
-                &compute_budget,
-                false, /* deployment */
-                false, /* debugging_features */
-            )
-            .unwrap();
-            let program_runtime_environment_v2 = create_program_runtime_environment_v2(
-                &compute_budget,
-                false, /* debugging_features */
-            );
+            let (program_runtime_environment_v1, program_runtime_environment_v2) =
+                self.create_program_runtime_environments(&upcoming_feature_set);
             let mut upcoming_environments = program_cache.environments.clone();
             let changed_program_runtime_v1 =
-                *upcoming_environments.program_runtime_v1 != program_runtime_environment_v1;
+                *upcoming_environments.program_runtime_v1 != *program_runtime_environment_v1;
             let changed_program_runtime_v2 =
-                *upcoming_environments.program_runtime_v2 != program_runtime_environment_v2;
+                *upcoming_environments.program_runtime_v2 != *program_runtime_environment_v2;
             if changed_program_runtime_v1 {
-                upcoming_environments.program_runtime_v1 = Arc::new(program_runtime_environment_v1);
+                upcoming_environments.program_runtime_v1 = program_runtime_environment_v1;
             }
             if changed_program_runtime_v2 {
-                upcoming_environments.program_runtime_v2 = Arc::new(program_runtime_environment_v2);
+                upcoming_environments.program_runtime_v2 = program_runtime_environment_v2;
             }
             program_cache.upcoming_environments = Some(upcoming_environments);
             program_cache.programs_to_recompile = program_cache
@@ -2751,6 +2758,7 @@ impl Bank {
     }
 
     /// Forget all signatures. Useful for benchmarking.
+    #[cfg(feature = "dev-context-only-utils")]
     pub fn clear_signatures(&self) {
         self.status_cache.write().unwrap().clear();
     }
@@ -2915,6 +2923,9 @@ impl Bank {
         &self,
         txs: Vec<VersionedTransaction>,
     ) -> Result<TransactionBatch<RuntimeTransaction<SanitizedTransaction>>> {
+        let enable_static_instruction_limit = self
+            .feature_set
+            .is_active(&agave_feature_set::static_instruction_limit::id());
         let sanitized_txs = txs
             .into_iter()
             .map(|tx| {
@@ -2924,6 +2935,7 @@ impl Bank {
                     None,
                     self,
                     self.get_reserved_account_keys(),
+                    enable_static_instruction_limit,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -4055,32 +4067,40 @@ impl Bank {
             self.apply_simd_0306_cost_tracker_changes();
         }
 
-        let simd_0268_active = self
-            .feature_set
-            .is_active(&raise_cpi_nesting_limit_to_8::id());
-
+        let (program_runtime_environment_v1, program_runtime_environment_v2) =
+            self.create_program_runtime_environments(&self.feature_set);
         self.transaction_processor
             .configure_program_runtime_environments(
-                Some(Arc::new(
-                    create_program_runtime_environment_v1(
-                        &self.feature_set.runtime_features(),
-                        &self
-                            .compute_budget()
-                            .unwrap_or(ComputeBudget::new_with_defaults(simd_0268_active))
-                            .to_budget(),
-                        false, /* deployment */
-                        false, /* debugging_features */
-                    )
-                    .unwrap(),
-                )),
-                Some(Arc::new(create_program_runtime_environment_v2(
-                    &self
-                        .compute_budget()
-                        .unwrap_or(ComputeBudget::new_with_defaults(simd_0268_active))
-                        .to_budget(),
-                    false, /* debugging_features */
-                ))),
+                Some(program_runtime_environment_v1),
+                Some(program_runtime_environment_v2),
             );
+    }
+
+    fn create_program_runtime_environments(
+        &self,
+        feature_set: &FeatureSet,
+    ) -> (ProgramRuntimeEnvironment, ProgramRuntimeEnvironment) {
+        let simd_0268_active = feature_set.is_active(&raise_cpi_nesting_limit_to_8::id());
+        let compute_budget = self
+            .compute_budget()
+            .as_ref()
+            .unwrap_or(&ComputeBudget::new_with_defaults(simd_0268_active))
+            .to_budget();
+        (
+            Arc::new(
+                create_program_runtime_environment_v1(
+                    &feature_set.runtime_features(),
+                    &compute_budget,
+                    false, /* deployment */
+                    false, /* debugging_features */
+                )
+                .unwrap(),
+            ),
+            Arc::new(create_program_runtime_environment_v2(
+                &compute_budget,
+                false, /* debugging_features */
+            )),
+        )
     }
 
     pub fn set_tick_height(&self, tick_height: u64) {
@@ -4194,7 +4214,7 @@ impl Bank {
         &self,
         program_id: &Pubkey,
         config: &ScanConfig,
-    ) -> ScanResult<Vec<TransactionAccount>> {
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         self.rc
             .accounts
             .load_by_program(&self.ancestors, self.bank_id, program_id, config)
@@ -4205,7 +4225,7 @@ impl Bank {
         program_id: &Pubkey,
         filter: F,
         config: &ScanConfig,
-    ) -> ScanResult<Vec<TransactionAccount>> {
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         self.rc.accounts.load_by_program_with_filter(
             &self.ancestors,
             self.bank_id,
@@ -4221,7 +4241,7 @@ impl Bank {
         filter: F,
         config: &ScanConfig,
         byte_limit_for_scan: Option<usize>,
-    ) -> ScanResult<Vec<TransactionAccount>> {
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         self.rc.accounts.load_by_index_key_with_filter(
             &self.ancestors,
             self.bank_id,
@@ -4256,7 +4276,7 @@ impl Bank {
     pub fn get_program_accounts_modified_since_parent(
         &self,
         program_id: &Pubkey,
-    ) -> Vec<TransactionAccount> {
+    ) -> Vec<KeyedAccountSharedData> {
         self.rc
             .accounts
             .load_by_program_slot(self.slot(), Some(program_id))
@@ -4273,7 +4293,7 @@ impl Bank {
     }
 
     /// Returns all the accounts stored in this slot
-    pub fn get_all_accounts_modified_since_parent(&self) -> Vec<TransactionAccount> {
+    pub fn get_all_accounts_modified_since_parent(&self) -> Vec<KeyedAccountSharedData> {
         self.rc.accounts.load_by_program_slot(self.slot(), None)
     }
 
@@ -4597,6 +4617,9 @@ impl Bank {
         tx: VersionedTransaction,
         verification_mode: TransactionVerificationMode,
     ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
+        let enable_static_instruction_limit = self
+            .feature_set
+            .is_active(&agave_feature_set::static_instruction_limit::id());
         let sanitized_tx = {
             let size =
                 bincode::serialized_size(&tx).map_err(|_| TransactionError::SanitizeFailure)?;
@@ -4605,6 +4628,13 @@ impl Bank {
             }
             let message_hash = if verification_mode == TransactionVerificationMode::FullVerification
             {
+                // SIMD-0160, check instruction limit before signature verificaton
+                if enable_static_instruction_limit
+                    && tx.message.instructions().len()
+                        > solana_transaction_context::MAX_INSTRUCTION_TRACE_LENGTH
+                {
+                    return Err(solana_transaction_error::TransactionError::SanitizeFailure);
+                }
                 tx.verify_and_hash_message()?
             } else {
                 tx.message.hash()
@@ -4616,6 +4646,7 @@ impl Bank {
                 None,
                 self,
                 self.get_reserved_account_keys(),
+                enable_static_instruction_limit,
             )
         }?;
 
@@ -5242,6 +5273,16 @@ impl Bank {
 
         if new_feature_activations.contains(&feature_set::raise_account_cu_limit::id()) {
             self.apply_simd_0306_cost_tracker_changes();
+        }
+
+        if new_feature_activations.contains(&feature_set::vote_state_v4::id()) {
+            if let Err(e) = self.upgrade_core_bpf_program(
+                &solana_sdk_ids::stake::id(),
+                &feature_set::vote_state_v4::stake_program_buffer::id(),
+                "upgrade_stake_program_for_vote_state_v4",
+            ) {
+                error!("Failed to upgrade Core BPF Stake program: {e}");
+            }
         }
     }
 
@@ -5979,11 +6020,12 @@ pub mod test_utils {
     use {
         super::Bank,
         crate::installed_scheduler_pool::BankWithScheduler,
-        solana_account::{ReadableAccount, WritableAccount},
+        solana_account::{state_traits::StateMut, ReadableAccount, WritableAccount},
         solana_instruction::error::LamportsError,
         solana_pubkey::Pubkey,
         solana_sha256_hasher::hashv,
-        solana_vote_program::vote_state::{self, BlockTimestamp, VoteStateVersions},
+        solana_vote_interface::state::VoteStateV4,
+        solana_vote_program::vote_state::{BlockTimestamp, VoteStateVersions},
         std::sync::Arc,
     };
     pub fn goto_end_of_slot(bank: Arc<Bank>) {
@@ -6008,10 +6050,12 @@ pub mod test_utils {
         vote_pubkey: &Pubkey,
     ) {
         let mut vote_account = bank.get_account(vote_pubkey).unwrap_or_default();
-        let mut vote_state = vote_state::from(&vote_account).unwrap_or_default();
+        let mut vote_state = VoteStateV4::deserialize(vote_account.data(), vote_pubkey)
+            .ok()
+            .unwrap_or_default();
         vote_state.last_timestamp = timestamp;
-        let versioned = VoteStateVersions::new_v3(vote_state);
-        vote_state::to(&versioned, &mut vote_account).unwrap();
+        let versioned = VoteStateVersions::new_v4(vote_state);
+        vote_account.set_state(&versioned).unwrap();
         bank.store_account(vote_pubkey, &vote_account);
     }
 
