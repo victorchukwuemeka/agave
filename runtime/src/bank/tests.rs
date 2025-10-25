@@ -35,7 +35,6 @@ use {
     solana_account_info::MAX_PERMITTED_DATA_INCREASE,
     solana_accounts_db::{
         accounts::AccountAddressFilter,
-        accounts_db::DEFAULT_ACCOUNTS_SHRINK_RATIO,
         accounts_index::{
             AccountIndex, AccountSecondaryIndexes, IndexKey, ScanConfig, ScanError, ITER_BATCH_SIZE,
         },
@@ -118,7 +117,7 @@ use {
     solana_vote_program::{
         vote_instruction,
         vote_state::{
-            self, create_account_with_authorized, BlockTimestamp, VoteAuthorize, VoteInit,
+            self, create_v4_account_with_authorized, BlockTimestamp, VoteAuthorize, VoteInit,
             VoteStateV4, VoteStateVersions, MAX_LOCKOUT_HISTORY,
         },
     },
@@ -149,17 +148,21 @@ impl VoteReward {
         let validator_pubkey = solana_pubkey::new_rand();
         let validator_stake_lamports = rng.gen_range(1..200);
         let validator_voting_keypair = Keypair::new();
+        let commission: u8 = rng.gen_range(1..20);
+        let commission_bps = u16::from(commission) * 100;
 
-        let validator_vote_account = vote_state::create_account(
-            &validator_voting_keypair.pubkey(),
+        let validator_vote_account = vote_state::create_v4_account_with_authorized(
             &validator_pubkey,
-            rng.gen_range(1..20),
+            &validator_voting_keypair.pubkey(),
+            &validator_voting_keypair.pubkey(),
+            None,
+            commission_bps,
             validator_stake_lamports,
         );
 
         Self {
             vote_account: validator_vote_account,
-            commission: rng.gen_range(1..20),
+            commission,
             vote_rewards: rng.gen_range(1..200),
         }
     }
@@ -371,8 +374,8 @@ fn test_bank_update_epoch_stakes() {
         assert_eq!(bank.epoch_stake_keys(), initial_epochs);
     }
 
-    for epoch in (initial_epochs.len() as Epoch)..MAX_LEADER_SCHEDULE_STAKES {
-        bank.update_epoch_stakes(epoch);
+    for epoch in (initial_epochs.len() as Epoch)..(MAX_LEADER_SCHEDULE_STAKES - 1) {
+        bank.update_epoch_stakes(dbg!(epoch));
         assert_eq!(bank.epoch_stakes.len() as Epoch, epoch + 1);
     }
 
@@ -380,8 +383,18 @@ fn test_bank_update_epoch_stakes() {
         bank.epoch_stake_key_info(),
         (
             0,
+            MAX_LEADER_SCHEDULE_STAKES - 2,
+            MAX_LEADER_SCHEDULE_STAKES as usize - 1,
+        )
+    );
+
+    bank.update_epoch_stakes(MAX_LEADER_SCHEDULE_STAKES - 1);
+    assert_eq!(
+        bank.epoch_stake_key_info(),
+        (
+            0,
             MAX_LEADER_SCHEDULE_STAKES - 1,
-            MAX_LEADER_SCHEDULE_STAKES as usize
+            MAX_LEADER_SCHEDULE_STAKES as usize,
         )
     );
 
@@ -389,19 +402,9 @@ fn test_bank_update_epoch_stakes() {
     assert_eq!(
         bank.epoch_stake_key_info(),
         (
-            0,
-            MAX_LEADER_SCHEDULE_STAKES,
-            MAX_LEADER_SCHEDULE_STAKES as usize + 1
-        )
-    );
-
-    bank.update_epoch_stakes(MAX_LEADER_SCHEDULE_STAKES + 1);
-    assert_eq!(
-        bank.epoch_stake_key_info(),
-        (
             1,
-            MAX_LEADER_SCHEDULE_STAKES + 1,
-            MAX_LEADER_SCHEDULE_STAKES as usize + 1
+            MAX_LEADER_SCHEDULE_STAKES,
+            MAX_LEADER_SCHEDULE_STAKES as usize,
         )
     );
 }
@@ -866,7 +869,15 @@ fn do_test_bank_update_rewards_determinism() -> u64 {
     );
 
     let vote_id = solana_pubkey::new_rand();
-    let mut vote_account = vote_state::create_account(&vote_id, &solana_pubkey::new_rand(), 0, 100);
+    let node_pubkey = solana_pubkey::new_rand();
+    let mut vote_account = vote_state::create_v4_account_with_authorized(
+        &node_pubkey,
+        &vote_id,
+        &vote_id,
+        None,
+        0,
+        100,
+    );
     let stake_id1 = solana_pubkey::new_rand();
     let stake_account1 = crate::stakes::tests::create_stake_account(123, &vote_id, &stake_id1);
     let stake_id2 = solana_pubkey::new_rand();
@@ -1746,24 +1757,27 @@ fn test_readonly_accounts(relax_intrabatch_account_locks: bool) {
     let payer1 = Keypair::new();
 
     // Create vote accounts
-    let vote_account0 = vote_state::create_account_with_authorized(
+    let vote_account0 = vote_state::create_v4_account_with_authorized(
         &vote_pubkey0,
         &authorized_voter.pubkey(),
         &authorized_voter.pubkey(),
+        None,
         0,
         100,
     );
-    let vote_account1 = vote_state::create_account_with_authorized(
+    let vote_account1 = vote_state::create_v4_account_with_authorized(
         &vote_pubkey1,
         &authorized_voter.pubkey(),
         &authorized_voter.pubkey(),
+        None,
         0,
         100,
     );
-    let vote_account2 = vote_state::create_account_with_authorized(
+    let vote_account2 = vote_state::create_v4_account_with_authorized(
         &vote_pubkey2,
         &authorized_voter.pubkey(),
         &authorized_voter.pubkey(),
+        None,
         0,
         100,
     );
@@ -5387,36 +5401,6 @@ fn test_same_program_id_uses_unique_executable_accounts() {
     assert_eq!(1, bank.get_account(&program2_pubkey).unwrap().data().len());
 }
 
-fn get_shrink_account_size() -> usize {
-    let (genesis_config, _mint_keypair) = create_genesis_config(1_000_000_000);
-
-    // Set root for bank 0, with caching disabled so we can get the size
-    // of the storage for this slot
-    let bank0 = Arc::new(Bank::new_with_config_for_tests(
-        &genesis_config,
-        BankTestConfig::default(),
-    ));
-    goto_end_of_slot(bank0.clone());
-    bank0.freeze();
-    bank0.squash();
-    add_root_and_flush_write_cache(&bank0);
-
-    let sizes = bank0
-        .rc
-        .accounts
-        .accounts_db
-        .sizes_of_accounts_in_storage_for_tests(0);
-
-    // Create an account such that it takes DEFAULT_ACCOUNTS_SHRINK_RATIO of the total account space for
-    // the slot, so when it gets pruned, the storage entry will become a shrink candidate.
-    let bank0_total_size: usize = sizes.into_iter().sum();
-    let pubkey0_size = (bank0_total_size as f64 / (1.0 - DEFAULT_ACCOUNTS_SHRINK_RATIO)).ceil();
-    assert!(
-        pubkey0_size / (pubkey0_size + bank0_total_size as f64) > DEFAULT_ACCOUNTS_SHRINK_RATIO
-    );
-    pubkey0_size as usize
-}
-
 #[test]
 fn test_clean_nonrooted() {
     solana_logger::setup();
@@ -5505,7 +5489,8 @@ fn test_shrink_candidate_slots_cached() {
         BankTestConfig::default(),
     ));
 
-    let pubkey0_size = get_shrink_account_size();
+    // Make pubkey0 large so any slot containing it is a candidate for shrinking
+    let pubkey0_size = 100_000;
 
     let account0 = AccountSharedData::new(1000, pubkey0_size, &Pubkey::new_unique());
     bank0.store_account(&pubkey0, &account0);
@@ -9933,9 +9918,11 @@ fn test_rent_state_changes_sysvars() {
     let validator_vote_account_pubkey = Pubkey::new_unique();
     let validator_voting_keypair = Keypair::new();
 
-    let validator_vote_account = vote_state::create_account(
-        &validator_voting_keypair.pubkey(),
+    let validator_vote_account = vote_state::create_v4_account_with_authorized(
         &validator_pubkey,
+        &validator_voting_keypair.pubkey(),
+        &validator_voting_keypair.pubkey(),
+        None,
         0,
         validator_stake_lamports,
     );
@@ -10960,16 +10947,10 @@ fn test_feature_activation_loaded_programs_cache_preparation_phase(
     let bank = new_bank_from_parent_with_bank_forks(&bank_forks, bank, &Pubkey::default(), 16);
     let current_env = bank
         .transaction_processor
-        .global_program_cache
-        .read()
-        .unwrap()
         .get_environments_for_epoch(0)
         .program_runtime_v1;
     let upcoming_env = bank
         .transaction_processor
-        .global_program_cache
-        .read()
-        .unwrap()
         .get_environments_for_epoch(1)
         .program_runtime_v1;
 
@@ -11081,12 +11062,19 @@ fn test_feature_activation_loaded_programs_epoch_transition() {
 
     {
         // Prune for rerooting and thus finishing the recompilation phase.
+        let upcoming_environments = bank
+            .transaction_processor
+            .epoch_boundary_preparation
+            .write()
+            .unwrap()
+            .reroot(bank.epoch());
+        assert!(upcoming_environments.is_some());
         let mut program_cache = bank
             .transaction_processor
             .global_program_cache
             .write()
             .unwrap();
-        program_cache.prune(bank.slot(), bank.epoch());
+        program_cache.prune(bank.slot(), upcoming_environments);
 
         // Unload all (which is only the entry with the new environment)
         program_cache.sort_and_unload(percentage::Percentage::from(0));
@@ -12275,10 +12263,11 @@ fn test_bank_epoch_stakes() {
                 .map(|keypair| {
                     let node_id = keypair.node_keypair.pubkey();
                     let authorized_voter = keypair.vote_keypair.pubkey();
-                    let vote_account = VoteAccount::try_from(create_account_with_authorized(
+                    let vote_account = VoteAccount::try_from(create_v4_account_with_authorized(
                         &node_id,
                         &authorized_voter,
                         &node_id,
+                        None,
                         0,
                         100,
                     ))

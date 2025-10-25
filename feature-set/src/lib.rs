@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 #![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 
 use {
@@ -755,11 +764,11 @@ pub mod apply_cost_tracker_during_replay {
 }
 
 pub mod stricter_abi_and_runtime_constraints {
-    solana_pubkey::declare_id!("CxeBn9PVeeXbmjbNwLv6U4C6svNxnC4JX6mfkvgeMocM");
+    solana_pubkey::declare_id!("sD3uVpaavUXQRvDXrMFCQ2CqLqnbz5mK8ttWNXbtD3r");
 }
 
 pub mod account_data_direct_mapping {
-    solana_pubkey::declare_id!("9s3RKimHWS44rJcJ9P1rwCmn2TvMqtZQBmz815ZUUHqJ");
+    solana_pubkey::declare_id!("DFN8MyKpQqFW31qczcahgnnxcAHQc6P94wtTEX5EP1RA");
 }
 
 pub mod add_set_tx_loaded_accounts_data_size_instruction {
@@ -1152,6 +1161,14 @@ pub mod vote_state_v4 {
     pub mod stake_program_buffer {
         solana_pubkey::declare_id!("BM11F4hqrpinQs28sEZfzQ2fYddivYs4NEAHF6QMjkJF");
     }
+}
+
+pub mod switch_to_chacha8_turbine {
+    solana_pubkey::declare_id!("CHaChatUnR3s6cPyPMMGNJa3VdQQ8PNH2JqdD4LpCKnB");
+}
+
+pub mod deprecate_rent_exemption_threshold {
+    solana_pubkey::declare_id!("rent6iVy6PDoViPBeJ6k5EJQrkj62h7DPyLbWGHwjrC");
 }
 
 pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::new(|| {
@@ -2081,6 +2098,14 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
              rules",
         ),
         (vote_state_v4::id(), "SIMD-0185: Vote State v4"),
+        (
+            switch_to_chacha8_turbine::id(),
+            "SIMD-0332: Reduce ChaCha rounds for Turbine from 20 to 8",
+        ),
+        (
+            deprecate_rent_exemption_threshold::id(),
+            "SIMD-0194: Deprecate rent exemption threshold",
+        ),
         /*************** ADD NEW FEATURES HERE ***************/
     ]
     .iter()

@@ -52,7 +52,7 @@ pub(crate) struct ConsensusPoolContext {
     pub(crate) event_sender: VotorEventSender,
     pub(crate) commitment_sender: Sender<CommitmentAggregationData>,
 
-    delta_standstill: Duration,
+    pub(crate) delta_standstill: Duration,
 }
 
 pub(crate) struct ConsensusPoolService {
@@ -132,7 +132,7 @@ impl ConsensusPoolService {
     fn process_consensus_message(
         ctx: &mut ConsensusPoolContext,
         my_pubkey: &Pubkey,
-        message: &ConsensusMessage,
+        message: ConsensusMessage,
         consensus_pool: &mut ConsensusPool,
         events: &mut Vec<VotorEvent>,
         standstill_timer: &mut Instant,
@@ -247,7 +247,7 @@ impl ConsensusPoolService {
                 match Self::process_consensus_message(
                     ctx,
                     &my_pubkey,
-                    &message,
+                    message,
                     &mut consensus_pool,
                     &mut events,
                     &mut standstill_timer,
@@ -275,7 +275,7 @@ impl ConsensusPoolService {
         root_bank: &Bank,
         my_pubkey: &Pubkey,
         my_vote_pubkey: &Pubkey,
-        message: &ConsensusMessage,
+        message: ConsensusMessage,
         consensus_pool: &mut ConsensusPool,
         votor_events: &mut Vec<VotorEvent>,
         commitment_sender: &Sender<CommitmentAggregationData>,
@@ -439,7 +439,7 @@ mod tests {
         // Make stake monotonic decreasing so rank is deterministic
         let stake = (0..validator_keypairs.len())
             .rev()
-            .map(|i| ((i.saturating_add(5).saturating_mul(100)) as u64))
+            .map(|i| (i.saturating_add(5).saturating_mul(100)) as u64)
             .collect::<Vec<_>>();
         let genesis = create_genesis_config_with_alpenglow_vote_accounts(
             1_000_000_000,
