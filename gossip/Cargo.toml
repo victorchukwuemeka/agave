@@ -15,8 +15,6 @@ targets = ["x86_64-unknown-linux-gnu"]
 [lib]
 bench = false
 
-
-
 [features]
 frozen-abi = [
     "dep:solana-frozen-abi",
