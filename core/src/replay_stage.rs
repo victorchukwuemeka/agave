@@ -84,7 +84,7 @@ use {
     solana_rpc_client_api::response::SlotUpdate,
     solana_runtime::{
         bank::{bank_hash_details, Bank, NewBankOptions},
-        bank_forks::{BankForks, MAX_ROOT_DISTANCE_FOR_VOTE_ONLY},
+        bank_forks::BankForks,
         commitment::BlockCommitmentCache,
         installed_scheduler_pool::BankWithScheduler,
         leader_schedule_utils::first_of_consecutive_leader_slots,
@@ -764,12 +764,9 @@ impl ReplayStage {
                 unfrozen_gossip_verified_vote_hashes,
                 epoch_slots_frozen_slots,
             };
-            let (working_bank, in_vote_only_mode) = {
+            let working_bank = {
                 let r_bank_forks = bank_forks.read().unwrap();
-                (
-                    r_bank_forks.working_bank(),
-                    r_bank_forks.get_vote_only_mode_signal(),
-                )
+                r_bank_forks.working_bank()
             };
             let mut last_threshold_failure_slot = 0;
             // Thread pool to (maybe) replay multiple threads in parallel
@@ -1070,13 +1067,6 @@ impl ReplayStage {
                         .heaviest_subtree_fork_choice
                         .select_forks(&frozen_banks, &tower, &progress, &ancestors, &bank_forks);
                     select_forks_time.stop();
-
-                    Self::check_for_vote_only_mode(
-                        heaviest_bank.slot(),
-                        forks_root,
-                        &in_vote_only_mode,
-                        &bank_forks,
-                    );
 
                     let mut select_vote_and_reset_forks_time =
                         Measure::start("select_vote_and_reset_forks");
@@ -1590,41 +1580,6 @@ impl ReplayStage {
                 ))
             }
             Err(err) => Err(err),
-        }
-    }
-
-    fn check_for_vote_only_mode(
-        heaviest_bank_slot: Slot,
-        forks_root: Slot,
-        in_vote_only_mode: &AtomicBool,
-        bank_forks: &RwLock<BankForks>,
-    ) {
-        if heaviest_bank_slot.saturating_sub(forks_root) > MAX_ROOT_DISTANCE_FOR_VOTE_ONLY {
-            if !in_vote_only_mode.load(Ordering::Relaxed)
-                && in_vote_only_mode
-                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-            {
-                let bank_forks = bank_forks.read().unwrap();
-                datapoint_warn!(
-                    "bank_forks-entering-vote-only-mode",
-                    ("banks_len", bank_forks.len(), i64),
-                    ("heaviest_bank", heaviest_bank_slot, i64),
-                    ("root", bank_forks.root(), i64),
-                );
-            }
-        } else if in_vote_only_mode.load(Ordering::Relaxed)
-            && in_vote_only_mode
-                .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            let bank_forks = bank_forks.read().unwrap();
-            datapoint_warn!(
-                "bank_forks-exiting-vote-only-mode",
-                ("banks_len", bank_forks.len(), i64),
-                ("heaviest_bank", heaviest_bank_slot, i64),
-                ("root", bank_forks.root(), i64),
-            );
         }
     }
 
@@ -2494,10 +2449,7 @@ impl ReplayStage {
             datapoint_info!("replay_stage-my_leader_slot", ("slot", poh_slot, i64),);
             info!("new fork:{poh_slot} parent:{parent_slot} (leader) root:{root_slot}");
 
-            let root_distance = poh_slot - root_slot;
-            let vote_only_bank = if root_distance > MAX_ROOT_DISTANCE_FOR_VOTE_ONLY
-                || migration_status.should_bank_be_vote_only(poh_slot)
-            {
+            let vote_only_bank = if migration_status.should_bank_be_vote_only(poh_slot) {
                 info!("{my_pubkey}: Creating block in slot {poh_slot} in VoM");
                 datapoint_info!("vote-only-bank", ("slot", poh_slot, i64));
                 true
@@ -9235,18 +9187,6 @@ pub(crate) mod tests {
         while poh_controller.has_pending_message() {
             std::hint::spin_loop();
         }
-    }
-
-    #[test]
-    fn test_check_for_vote_only_mode() {
-        let in_vote_only_mode = AtomicBool::new(false);
-        let genesis_config = create_genesis_config(10_000).genesis_config;
-        let bank0 = Bank::new_for_tests(&genesis_config);
-        let bank_forks = BankForks::new_rw_arc(bank0);
-        ReplayStage::check_for_vote_only_mode(1000, 0, &in_vote_only_mode, &bank_forks);
-        assert!(in_vote_only_mode.load(Ordering::Relaxed));
-        ReplayStage::check_for_vote_only_mode(10, 0, &in_vote_only_mode, &bank_forks);
-        assert!(!in_vote_only_mode.load(Ordering::Relaxed));
     }
 
     #[test]
