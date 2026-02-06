@@ -416,6 +416,12 @@ pub struct IndexGenerationInfo {
 }
 
 #[derive(Debug, Default)]
+struct IndexGenerationThreadState {
+    keyed_account_infos: Vec<(Pubkey, AccountInfo)>,
+    storage_info: StorageSizeAndCountList,
+}
+
+#[derive(Debug, Default)]
 struct SlotIndexGenerationInfo {
     insert_time_us: u64,
     num_accounts: u64,
@@ -490,8 +496,7 @@ struct StorageSizeAndCount {
     /// number of accounts in the storage including both alive and dead accounts
     pub count: usize,
 }
-type StorageSizeAndCountMap =
-    DashMap<AccountsFileId, StorageSizeAndCount, BuildNoHashHasher<AccountsFileId>>;
+type StorageSizeAndCountList = Vec<(AccountsFileId, StorageSizeAndCount)>;
 
 impl GenerateIndexTimings {
     pub fn report(&self, startup_stats: &StartupStats) {
@@ -6144,10 +6149,10 @@ impl AccountsDb {
     fn generate_index_for_slot<'a>(
         &self,
         reader: &mut impl RequiredLenBufFileRead<'a>,
+        thread_state: &mut IndexGenerationThreadState,
         storage: &'a AccountStorageEntry,
         slot: Slot,
         store_id: AccountsFileId,
-        storage_info: &StorageSizeAndCountMap,
     ) -> SlotIndexGenerationInfo {
         let mut accounts_data_len = 0;
         let mut stored_size_alive = 0;
@@ -6155,7 +6160,10 @@ impl AccountsDb {
         let mut zero_lamport_offsets = vec![];
         let mut all_accounts_are_zero_lamports = true;
         let mut slot_lt_hash = SlotLtHash::default();
-        let mut keyed_account_infos = vec![];
+        assert!(
+            thread_state.keyed_account_infos.is_empty(),
+            "only reuse capacity, not items"
+        );
 
         let geyser_notifier = self
             .accounts_update_notifier
@@ -6207,7 +6215,7 @@ impl AccountsDb {
                     }
                     zero_lamport_pubkeys.push(*account.pubkey);
                 }
-                keyed_account_infos.push((
+                thread_state.keyed_account_infos.push((
                     *account.pubkey,
                     AccountInfo::new(
                         StorageLocation::AppendVec(store_id, offset), // will never be cached
@@ -6248,13 +6256,14 @@ impl AccountsDb {
 
         let (insert_info, insert_time_us) = measure_us!(self
             .accounts_index
-            .insert_new_if_missing_into_primary_index(slot, keyed_account_infos));
+            .insert_new_if_missing_into_primary_index(slot, &mut thread_state.keyed_account_infos));
 
         if insert_info.count > 0 {
-            // second, collect into the shared DashMap once we've figured out all the info per store_id
-            let mut info = storage_info.entry(store_id).or_default();
-            info.stored_size += stored_size_alive;
-            info.count += insert_info.count;
+            // push summary info for store_id into thread state (all threads build a piece of full list)
+            let info = StorageSizeAndCount {
+                stored_size: stored_size_alive,
+                count: insert_info.count,
+            };
 
             // sanity check that stored_size is not larger than the u64 aligned size of the accounts files.
             // Note that the stored_size is aligned, so it can be larger than the size of the accounts file.
@@ -6266,6 +6275,7 @@ impl AccountsDb {
                 storage.accounts.len(),
                 store_id
             );
+            thread_state.storage_info.push((store_id, info));
         }
         // zero_lamport_pubkeys are candidates for cleaning. So add them to uncleaned_pubkeys
         // for later cleaning. If there is just a single item, there is no cleaning to
@@ -6314,7 +6324,7 @@ impl AccountsDb {
         let num_storages = storages.len();
 
         self.accounts_index.set_startup(Startup::Startup);
-        let storage_info = StorageSizeAndCountMap::default();
+        let mut storage_infos = vec![];
 
         /// Accumulator for the values produced while generating the index
         #[derive(Debug)]
@@ -6377,6 +6387,7 @@ impl AccountsDb {
                         .name(format!("solGenIndex{i:02}"))
                         .spawn_scoped(s, || {
                             let mut thread_accum = IndexGenerationAccumulator::new();
+                            let mut state = IndexGenerationThreadState::default();
                             let mut reader = append_vec::new_scan_accounts_reader();
                             for next_item in storages_orderer.iter() {
                                 self.maybe_throttle_index_generation();
@@ -6385,10 +6396,10 @@ impl AccountsDb {
                                 let slot = storage.slot();
                                 let slot_info = self.generate_index_for_slot(
                                     &mut reader,
+                                    &mut state,
                                     storage,
                                     slot,
                                     store_id,
-                                    &storage_info,
                                 );
                                 thread_accum.insert_us += slot_info.insert_time_us;
                                 thread_accum.num_accounts += slot_info.num_accounts;
@@ -6411,7 +6422,7 @@ impl AccountsDb {
                                     slot_info.num_obsolete_accounts_skipped;
                                 num_processed.fetch_add(1, Ordering::Relaxed);
                             }
-                            thread_accum
+                            (state, thread_accum)
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()
@@ -6442,10 +6453,11 @@ impl AccountsDb {
                 })
                 .expect("spawn thread");
             for thread_handle in thread_handles {
-                let Ok(thread_accum) = thread_handle.join() else {
+                let Ok((thread_state, thread_accum)) = thread_handle.join() else {
                     exit_logger.store(true, Ordering::Relaxed);
                     panic!("index generation failed");
                 };
+                storage_infos.push(thread_state.storage_info);
                 total_accum.accumulate(thread_accum);
             }
             // Make sure to join the logger thread *after* the main threads.
@@ -6652,7 +6664,7 @@ impl AccountsDb {
             self.accounts_index.add_root(storage.slot());
         }
 
-        self.set_storage_count_and_alive_bytes(storage_info, &mut timings);
+        self.set_storage_count_and_alive_bytes(storage_infos, &mut timings);
 
         if self.mark_obsolete_accounts == MarkObsoleteAccounts::Enabled {
             let mut mark_obsolete_accounts_time = Measure::start("mark_obsolete_accounts_time");
@@ -6912,11 +6924,13 @@ impl AccountsDb {
 
     fn set_storage_count_and_alive_bytes(
         &self,
-        stored_sizes_and_counts: StorageSizeAndCountMap,
+        stored_sizes_and_counts: Vec<StorageSizeAndCountList>,
         timings: &mut GenerateIndexTimings,
     ) {
         // store count and size for each storage
         let mut storage_size_storages_time = Measure::start("storage_size_storages");
+        let stored_sizes_and_counts: IntMap<_, _> =
+            stored_sizes_and_counts.into_iter().flatten().collect();
         for (_slot, store) in self.storage.iter() {
             let id = store.id();
             // Should be default at this point
