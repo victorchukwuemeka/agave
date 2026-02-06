@@ -6596,3 +6596,224 @@ fn test_batch_insert_zero_lamport_single_ref_account_offsets() {
     assert_eq!(count5, 3, "Should insert only 3 new offsets (60, 70, 80)");
     assert_eq!(storage.num_zero_lamport_single_ref_accounts(), 8);
 }
+
+#[test]
+fn test_new_zero_lamport_accounts_skipped() {
+    let accounts_db = AccountsDb::new_single_for_tests();
+    let pubkey1 = Pubkey::new_unique();
+    let pubkey2 = Pubkey::new_unique();
+    let pubkey3 = Pubkey::new_unique();
+    let zero_account = AccountSharedData::new(0, 0, &Pubkey::default());
+    let account = AccountSharedData::new(100, 0, &Pubkey::default());
+    let slot = 0;
+
+    // 1. Insert a single zero-lamport account and verify it is not added to the index or the
+    //    write cache. Since this is the first write to this slot, the slot cache should not be
+    //    created.
+    accounts_db.store_accounts_unfrozen(
+        (slot, [(&pubkey1, &zero_account)].as_slice()),
+        UpdateIndexThreadSelection::Inline,
+    );
+    assert!(!accounts_db.accounts_index.contains(&pubkey1));
+    assert!(accounts_db.accounts_cache.slot_cache(slot).is_none());
+
+    // 2. Insert a zero-lamport (pubkey1) together with non-zero lamport accounts
+    //    (pubkey2, pubkey3) in the same slot and verify only the non-zero lamport pubkeys are
+    //    indexed.
+    accounts_db.store_accounts_unfrozen(
+        (
+            slot,
+            [
+                (&pubkey1, &zero_account),
+                (&pubkey2, &account),
+                (&pubkey3, &account),
+            ]
+            .as_slice(),
+        ),
+        UpdateIndexThreadSelection::Inline,
+    );
+    assert!(!accounts_db.accounts_index.contains(&pubkey1));
+    assert!(!accounts_db
+        .accounts_cache
+        .slot_cache(slot)
+        .unwrap()
+        .contains_key(&pubkey1));
+    assert!(accounts_db.accounts_index.contains(&pubkey2));
+    assert!(accounts_db
+        .accounts_cache
+        .slot_cache(slot)
+        .unwrap()
+        .contains_key(&pubkey2));
+    assert!(accounts_db.accounts_index.contains(&pubkey3));
+    assert!(accounts_db
+        .accounts_cache
+        .slot_cache(slot)
+        .unwrap()
+        .contains_key(&pubkey3));
+
+    // 3. Insert a zero-lamport update for an already-indexed pubkey (pubkey2).
+    //    Verify pubkey2 remains in the index and gets added to the slot cache.
+    accounts_db.store_accounts_unfrozen(
+        (slot, [(&pubkey2, &zero_account)].as_slice()),
+        UpdateIndexThreadSelection::Inline,
+    );
+    assert!(accounts_db.accounts_index.contains(&pubkey2));
+    assert!(accounts_db
+        .accounts_cache
+        .slot_cache(slot)
+        .unwrap()
+        .contains_key(&pubkey2));
+
+    // 4. Flush the slot to simulate write-cache -> storage transition and verify
+    //    pubkey1 is still not present while pubkey2 remains indexed but is now zero-lamport.
+    accounts_db.add_root_and_flush_write_cache(slot);
+    assert!(!accounts_db.accounts_index.contains(&pubkey1));
+    assert!(accounts_db.accounts_index.contains(&pubkey2));
+    assert!(accounts_db.accounts_index.contains(&pubkey3));
+
+    // Verify pubkey2 is present in slot in the index with a zero-lamport AccountInfo.
+    assert!(accounts_db.accounts_index.get_and_then(&pubkey2, |entry| {
+        let account_info = *entry.unwrap().slot_list_read_lock().first().unwrap();
+        (false, account_info.1.is_zero_lamport())
+    }));
+
+    // 5. Add a non-zero lamport account for a pubkey that was previously only written as zero
+    //    (pubkey1) and verify the pubkey is added to the index.
+    let slot = slot + 1;
+    accounts_db.store_accounts_unfrozen(
+        (slot, [(&pubkey1, &account)].as_slice()),
+        UpdateIndexThreadSelection::Inline,
+    );
+    assert!(accounts_db.accounts_index.contains(&pubkey1));
+
+    // 6. Set pubkey3 to zero lamports and flush. Verify pubkey3 is present in the index with
+    // a zero-lamport AccountInfo after flushing.
+    accounts_db.store_accounts_unfrozen(
+        (slot, [(&pubkey3, &zero_account)].as_slice()),
+        UpdateIndexThreadSelection::Inline,
+    );
+    accounts_db.add_root_and_flush_write_cache(slot);
+
+    // Verify pubkey3 is present in slot in the index with a zero-lamport AccountInfo.
+    let slot_list = accounts_db.accounts_index.get_and_then(&pubkey3, |entry| {
+        let entry = entry.expect("must exist");
+        (false, entry.slot_list_read_lock().clone_list())
+    });
+
+    // pubkey3 should be present in the index and marked as zero-lamport for this slot.
+    let account_info = slot_list.iter().find(|(s, _)| *s == slot).unwrap();
+    assert!(account_info.1.is_zero_lamport());
+}
+
+#[derive(Debug, Clone)]
+enum InitialState {
+    None,
+    WithLamports(u64),
+    WithoutLamports,
+}
+
+#[test_case(InitialState::None, vec![0], None, 1, 0;
+    "store_single_zero_lamport")]
+#[test_case(InitialState::None, vec![100, 200, 300], Some(300), 0, 2;
+"store_multiple_duplicates_some_lamports")]
+#[test_case(InitialState::None, vec![11, 0, 12, 0], None, 1, 3;
+    "store_mixed_accounts_ending_with_zero_lamports")]
+#[test_case(InitialState::None, vec![0, 5, 0, 10], Some(10), 0, 3;
+"store_mixed_accounts_ending_with_nonzero_lamports")]
+#[test_case(InitialState::WithLamports(10), vec![0], Some(0), 0, 0;
+"overwrite_existing_account_with_zero_lamports")]
+#[test_case(InitialState::WithLamports(50), vec![101, 102, 103], Some(103), 0, 2;
+"overwrite_existing_account_with_duplicate_some_lamports")]
+#[test_case(InitialState::WithLamports(50), vec![0, 5, 0, 10], Some(10), 0, 3;
+"overwrite_existing_account_mixed_ending_some_lamports")]
+#[test_case(InitialState::WithLamports(50), vec![11, 0, 12, 0], Some(0), 0, 3;
+"overwrite_existing_account_mixed_ending_zero_lamports")]
+#[test_case(InitialState::WithoutLamports, vec![0], Some(0), 0, 0;
+"overwrite_zero_lamport_account_with_zero_lamports")]
+#[test_case(InitialState::WithoutLamports, vec![5], Some(5), 0, 0;
+"overwrite_zero_lamport_account_with_some_lamports")]
+#[test_case(InitialState::WithoutLamports, vec![0, 10, 0, 15], Some(15), 0, 3;
+"overwrite_zero_lamport_account_mixed_ending_some_lamports")]
+#[test_case(InitialState::WithoutLamports, vec![12, 0, 25, 0], Some(0),0, 3;
+"overwrite_zero_lamport_account__mixed_ending_zero_lamports")]
+fn test_write_accounts_to_cache_scenarios(
+    initial_state: InitialState,
+    batch_accounts: Vec<u64>,
+    expected_lamports: Option<u64>,
+    expected_ephemeral_skips: u64,
+    expected_duplicate_skips: u64,
+) {
+    let db = AccountsDb::new_single_for_tests();
+    let slot: Slot = 1;
+    let key = solana_pubkey::new_rand();
+    let ancestors = vec![(1, 1), (2, 2)].into_iter().collect();
+
+    // Setup initial state
+    match initial_state {
+        InitialState::None => {
+            // No setup needed
+        }
+        InitialState::WithLamports(lamports) => {
+            let account = AccountSharedData::new(lamports, 0, &Pubkey::default());
+            db.store_accounts_unfrozen(
+                (slot, [(&key, &account)].as_slice()),
+                UpdateIndexThreadSelection::Inline,
+            );
+        }
+        InitialState::WithoutLamports => {
+            let account = AccountSharedData::new(1, 0, &Pubkey::default());
+            let account_zero = AccountSharedData::new(0, 0, &Pubkey::default());
+            // Store a non-zero account first to create the index entry
+            db.store_accounts_unfrozen(
+                (slot, [(&key, &account)].as_slice()),
+                UpdateIndexThreadSelection::Inline,
+            );
+            // Overwrite with a zero-lamport account to simulate ephemeral setup
+            db.store_accounts_unfrozen(
+                (slot, [(&key, &account_zero)].as_slice()),
+                UpdateIndexThreadSelection::Inline,
+            );
+        }
+    }
+
+    let slot = 2;
+    // Store batch accounts
+    let accounts: Vec<_> = batch_accounts
+        .iter()
+        .map(|&lamports| AccountSharedData::new(lamports, 0, &Pubkey::default()))
+        .collect();
+    let batch: Vec<_> = accounts.iter().map(|account| (&key, account)).collect();
+
+    db.store_accounts_unfrozen((slot, batch.as_slice()), UpdateIndexThreadSelection::Inline);
+
+    // Verify results
+    let loaded = db.load_without_fixed_root(&ancestors, &key);
+    match expected_lamports {
+        Some(expected) => {
+            assert!(loaded.is_some(), "Account should be loadable");
+            let (acc, _) = loaded.unwrap();
+            assert_eq!(acc.lamports(), expected, "Wrong lamports");
+        }
+        None => {
+            assert!(loaded.is_none(), "Account should not be loadable");
+        }
+    }
+
+    let ephemeral = db
+        .stats
+        .num_ephemeral_accounts_skipped
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        ephemeral, expected_ephemeral_skips,
+        "Wrong number of ephemeral skips"
+    );
+
+    let duplicates = db
+        .stats
+        .num_duplicate_accounts_skipped
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        duplicates, expected_duplicate_skips,
+        "Wrong number of duplicate skips"
+    );
+}
