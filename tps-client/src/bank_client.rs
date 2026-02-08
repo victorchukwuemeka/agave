@@ -130,7 +130,9 @@ impl TpsClient for BankClient {
         _end_slot: Option<u64>,
         _commitment_config: CommitmentConfig,
     ) -> TpsClientResult<Vec<u64>> {
-        unimplemented!("BankClient doesn't support get_blocks");
+        Err(TpsClientError::Custom(
+            "BankClient doesn't support get_blocks"
+        ));
     }
 
     fn get_block_with_config(
