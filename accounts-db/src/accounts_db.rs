@@ -5578,6 +5578,7 @@ impl AccountsDb {
         &self,
         accounts: impl StorableAccounts<'a>,
         update_index_thread_selection: UpdateIndexThreadSelection,
+        ancestors: Option<&Ancestors>,
     ) {
         // If all transactions in a batch are errored,
         // it's possible to get a store with no accounts.
@@ -5597,7 +5598,7 @@ impl AccountsDb {
         // Store the accounts in the write cache
         let mut store_accounts_time = Measure::start("store_accounts");
         let (store_account, cache_account_store_stats) =
-            self.write_accounts_to_cache(accounts.target_slot(), &accounts);
+            self.write_accounts_to_cache(accounts.target_slot(), &accounts, ancestors);
         store_accounts_time.stop();
         self.stats
             .store_accounts_to_cache_us
@@ -5622,6 +5623,10 @@ impl AccountsDb {
         );
         self.stats.num_duplicate_accounts_skipped.fetch_add(
             cache_account_store_stats.num_duplicate_accounts_skipped,
+            Ordering::Relaxed,
+        );
+        self.stats.num_ancestors_zero_lamport_skipped.fetch_add(
+            cache_account_store_stats.num_ancestors_zero_lamport_skipped,
             Ordering::Relaxed,
         );
         self.report_store_timings();
@@ -5754,6 +5759,7 @@ impl AccountsDb {
         &self,
         slot: Slot,
         accounts_and_meta_to_store: &impl StorableAccounts<'b>,
+        ancestors: Option<&Ancestors>,
     ) -> (BitVec, CacheAccountStoreStats) {
         let len = accounts_and_meta_to_store.len();
         let mut pubkey_set = HashSet::with_capacity_and_hasher(len, PubkeyHasherBuilder::default());
@@ -5770,13 +5776,30 @@ impl AccountsDb {
                     cache_account_store_stats.num_duplicate_accounts_skipped += 1;
                     return;
                 }
-                if account.is_zero_lamport()
-                    && self
+                if account.is_zero_lamport() {
+                    if ancestors.is_some() {
+                        if let Some(is_zero_lamport) = self.accounts_index.get_with_and_then(
+                            pubkey,
+                            ancestors,
+                            None,
+                            true,
+                            |(_, account)| account.is_zero_lamport(),
+                        ) {
+                            if is_zero_lamport {
+                                cache_account_store_stats.num_ancestors_zero_lamport_skipped += 1;
+                                return;
+                            }
+                        } else {
+                            cache_account_store_stats.num_ephemeral_accounts_skipped += 1;
+                            return;
+                        }
+                    } else if self
                         .accounts_index
                         .get_and_then(pubkey, |account| (true, account.is_none()))
-                {
-                    cache_account_store_stats.num_ephemeral_accounts_skipped += 1;
-                    return;
+                    {
+                        cache_account_store_stats.num_ephemeral_accounts_skipped += 1;
+                        return;
+                    }
                 }
 
                 self.accounts_cache
@@ -6050,6 +6073,13 @@ impl AccountsDb {
                     "num_duplicate_accounts_skipped",
                     self.stats
                         .num_duplicate_accounts_skipped
+                        .swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "num_ancestors_zero_lamport_skipped",
+                    self.stats
+                        .num_ancestors_zero_lamport_skipped
                         .swap(0, Ordering::Relaxed),
                     i64
                 ),
@@ -7052,10 +7082,15 @@ impl AccountsDb {
         self.store_accounts_unfrozen(
             (slot, pre_populate_zero_lamport.as_slice()),
             UpdateIndexThreadSelection::PoolWithThreshold,
+            None,
         );
 
         // Then store the actual accounts provided by the caller.
-        self.store_accounts_unfrozen(accounts, UpdateIndexThreadSelection::PoolWithThreshold);
+        self.store_accounts_unfrozen(
+            accounts,
+            UpdateIndexThreadSelection::PoolWithThreshold,
+            None,
+        );
     }
 
     #[allow(clippy::needless_range_loop)]
