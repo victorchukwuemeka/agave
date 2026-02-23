@@ -3588,7 +3588,6 @@ impl AccountsDb {
         self.do_load(
             ancestors,
             pubkey,
-            None,
             load_hint,
             LoadZeroLamports::None,
             populate_read_cache,
@@ -3613,13 +3612,12 @@ impl AccountsDb {
         &'a self,
         ancestors: &Ancestors,
         pubkey: &'a Pubkey,
-        max_root: Option<Slot>,
         clone_in_lock: bool,
     ) -> Option<(Slot, StorageLocation, Option<LoadedAccountAccessor<'a>>)> {
         self.accounts_index.get_with_and_then(
             pubkey,
             Some(ancestors),
-            max_root,
+            None,
             true,
             |(slot, account_info)| {
                 let storage_location = account_info.storage_location();
@@ -3636,7 +3634,6 @@ impl AccountsDb {
         mut storage_location: StorageLocation,
         ancestors: &'a Ancestors,
         pubkey: &'a Pubkey,
-        max_root: Option<Slot>,
         load_hint: LoadHint,
     ) -> Option<(LoadedAccountAccessor<'a>, Slot)> {
         // Happy drawing time! :)
@@ -3849,12 +3846,7 @@ impl AccountsDb {
 
             // Because reading from the cache/storage failed, retry from the index read
             let (new_slot, new_storage_location, maybe_account_accessor) = self
-                .read_index_for_accessor_or_load_slow(
-                    ancestors,
-                    pubkey,
-                    max_root,
-                    fallback_to_slow_path,
-                )?;
+                .read_index_for_accessor_or_load_slow(ancestors, pubkey, fallback_to_slow_path)?;
             // Notice the subtle `?` at previous line, we bail out pretty early if missing.
 
             if new_slot == slot && new_storage_location.is_store_id_equal(&storage_location) {
@@ -3912,7 +3904,6 @@ impl AccountsDb {
         &self,
         ancestors: &Ancestors,
         pubkey: &Pubkey,
-        max_root: Option<Slot>,
         load_hint: LoadHint,
         load_zero_lamports: LoadZeroLamports,
         populate_read_cache: PopulateReadCache,
@@ -3920,7 +3911,6 @@ impl AccountsDb {
         self.do_load_with_populate_read_cache(
             ancestors,
             pubkey,
-            max_root,
             load_hint,
             load_zero_lamports,
             populate_read_cache,
@@ -3940,7 +3930,6 @@ impl AccountsDb {
         self.do_load_with_populate_read_cache(
             ancestors,
             pubkey,
-            None,
             LoadHint::Unspecified,
             LoadZeroLamports::None,
             should_put_in_read_cache,
@@ -3951,18 +3940,14 @@ impl AccountsDb {
         &self,
         ancestors: &Ancestors,
         pubkey: &Pubkey,
-        max_root: Option<Slot>,
         load_hint: LoadHint,
         load_zero_lamports: LoadZeroLamports,
         populate_read_cache: PopulateReadCache,
     ) -> Option<(AccountSharedData, Slot)> {
-        #[cfg(not(test))]
-        assert!(max_root.is_none());
-
         let starting_max_root = self.accounts_index.max_root_inclusive();
 
         let (slot, storage_location, _maybe_account_accessor) =
-            self.read_index_for_accessor_or_load_slow(ancestors, pubkey, max_root, false)?;
+            self.read_index_for_accessor_or_load_slow(ancestors, pubkey, false)?;
         // Notice the subtle `?` at previous line, we bail out pretty early if missing.
 
         let in_write_cache = storage_location.is_cached();
@@ -3981,7 +3966,6 @@ impl AccountsDb {
             storage_location,
             ancestors,
             pubkey,
-            max_root,
             load_hint,
         )?;
         // note that the account being in the cache could be different now than it was previously
@@ -4022,6 +4006,7 @@ impl AccountsDb {
         Some((account, slot))
     }
 
+    #[cfg_attr(test, qualifiers(pub(crate)))]
     fn get_account_accessor<'a>(
         &'a self,
         slot: Slot,
@@ -6982,7 +6967,6 @@ impl AccountsDb {
         self.do_load(
             ancestors,
             pubkey,
-            None,
             LoadHint::Unspecified,
             // callers of this expect zero lamport accounts that exist in the index to be returned as Some(empty)
             LoadZeroLamports::SomeWithZeroLamportAccountForTests,
